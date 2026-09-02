@@ -115,12 +115,15 @@ impl ProcessService {
 
         if sandbox_enabled {
             let mut profile = sandbox::build_profile();
-            // namespace: 非 user namespace 的 unshare 需要 CAP_SYS_ADMIN（root），
-            // 无特权环境优雅降级 —— 跳过 namespace，保留 seccomp / no_new_privs。
-            let ns_ok = self.inner.kit.namespace.supported()
+            // 完整沙箱（namespace + seccomp + capability 收缩）需要 root：非 user
+            // namespace 的 unshare 需要 CAP_SYS_ADMIN。无特权环境优雅降级 ——
+            // 仅保留 no_new_privs + cgroup 尽力而为，避免 allowlist 兼容性问题。
+            let full_sandbox = self.inner.kit.namespace.supported()
                 && aion_adapter::namespace::can_create_namespaces();
-            if !ns_ok {
+            if !full_sandbox {
                 profile.namespaces = aion_adapter::NamespaceSet::default();
+                profile.seccomp = None;
+                profile.capabilities = aion_adapter::CapabilitySet::all();
             }
             // cgroup: 尽力而为；失败（如未挂载/无权限）不阻塞启动，发警告事件
             if profile.cgroup.is_some() || !self.inner.kit.cgroup.is_emulated() {

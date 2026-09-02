@@ -215,6 +215,8 @@ pub fn default_allowlist() -> Vec<i64> {
         libc::SYS_getdents64 as i64,
         libc::SYS_faccessat as i64,
         libc::SYS_faccessat2 as i64,
+        libc::SYS_access as i64,
+        libc::SYS_statx as i64,
         libc::SYS_readlink as i64,
         libc::SYS_readlinkat as i64,
         libc::SYS_statfs as i64,

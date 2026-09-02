@@ -115,12 +115,14 @@ crates/
 
 ## 平台支持
 
-| 能力 | Linux | Windows / macOS |
-|------|:-----:|:---------------:|
-| 编译 & 测试（CI） | ✅ | ✅ |
-| 进程 / 文件 / 网络 / 终端 | ✅ | ✅ |
-| namespace / seccomp / capability / cgroup v2 | ✅ 真实系统调用 | ❌（内存模拟或返回 Unsupported） |
-| 进程沙箱强制执行 | ✅ | ❌（`SpawnedProcess::sandboxed = false`） |
+| 能力 | Linux (root) | Linux (非 root) | Windows / macOS |
+|------|:-----:|:-----:|:---------------:|
+| 编译 & 测试（CI） | ✅ | ✅ | ✅ |
+| 进程 / 文件 / 网络 / 终端 | ✅ | ✅ | ✅ |
+| namespace 隔离 | ✅ | ➖ 自动跳过 | ❌（内存模拟或返回 Unsupported） |
+| seccomp / capability 收缩 | ✅ | ➖ 自动跳过 | ❌ |
+| cgroup v2 资源限制 | ✅ | 尽力而为（失败发警告事件） | ❌（内存模拟） |
+| 进程沙箱强制执行 | ✅ `sandboxed=true` | ⚠️ 仅 `no_new_privs` | ❌（`sandboxed=false`） |
 
 > 非 Linux 平台上运行时不会失败：cgroup 走 `EmulatedCgroupAdapter`，namespace/seccomp 报告不支持，
 > 沙箱是否真实执行通过 `sandboxed` 标记暴露给服务层与演示输出。
