@@ -33,6 +33,47 @@ pub struct ToolResult {
     pub events: Vec<UIBlock>,
 }
 
+impl ToolResult {
+    /// `Success` 构造器：携带 `data`，`call_id` 由调用方填。
+    pub fn success(data: serde_json::Value) -> Self {
+        Self {
+            call_id: CallId::new(),
+            status: ResultStatus::Success,
+            data,
+            artifacts: Vec::new(),
+            events: Vec::new(),
+        }
+    }
+
+    /// `Error` 构造器。
+    pub fn error(kind: ErrorKind, message: impl Into<String>) -> Self {
+        Self {
+            call_id: CallId::new(),
+            status: ResultStatus::Error {
+                kind,
+                message: message.into(),
+            },
+            data: serde_json::Value::Null,
+            artifacts: Vec::new(),
+            events: Vec::new(),
+        }
+    }
+
+    /// `Denied` 构造器：capability / 路径白名单等权限拒绝。
+    pub fn denied(cap: impl Into<String>, hint: impl Into<String>) -> Self {
+        Self {
+            call_id: CallId::new(),
+            status: ResultStatus::Denied {
+                cap: cap.into(),
+                hint: hint.into(),
+            },
+            data: serde_json::Value::Null,
+            artifacts: Vec::new(),
+            events: Vec::new(),
+        }
+    }
+}
+
 /// Tool 执行状态。
 ///
 /// 终结态：`Success / Error / Denied`。**需要用户介入**的中间态：`Pending`。

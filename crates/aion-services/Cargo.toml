@@ -1,6 +1,6 @@
 [package]
 name = "aion-services"
-description = "AION 服务层 — 基于 Cordis-RS Service 的系统服务: process / file / network / terminal / sandbox / storage / device / model"
+description = "AION 服务层 — 基于 Cordis-RS Service 的系统服务 + Tool 运行时（Phase 2）"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,8 +9,13 @@ repository.workspace = true
 [dependencies]
 cordis.workspace = true
 aion-adapter.workspace = true
+aion-protocol.workspace = true
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 async-trait.workspace = true
+base64 = "0.22"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"

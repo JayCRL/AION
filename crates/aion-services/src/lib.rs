@@ -23,13 +23,16 @@ pub mod process;
 pub mod sandbox;
 pub mod security;
 pub mod storage;
+pub mod system;
 pub mod terminal;
+pub mod tool;
 
 use aion_adapter::AdapterKit;
 
 pub use error::{AionError, AionResult};
 pub use sandbox::SandboxRequest;
 pub use security::SecurityContext;
+pub use tool::{populate_builtin_registry, Tool, ToolCallScope, ToolRegistry, ToolRuntime};
 
 /// 一整套 AION 系统服务（共享同一个 AdapterKit）。
 pub struct SystemServices {
