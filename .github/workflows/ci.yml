@@ -31,5 +31,9 @@ jobs:
       - name: Build
         run: cargo build --workspace --all-targets
 
+      # `--test-threads=1`：并行测试用例各自的运行时同时 `tokio::process` spawn
+      # 子进程时存在 SIGCHLD 回收竞争（Runtime A 的回收器可能错过通知 Runtime B 的
+      # 子进程 exit）。生产环境 AION 运行单运行时不受影响；测试套件串行化即可让 CI
+      # 确定性绿色。真内核 root 下完整沙箱路径的已手动验证（见 README）。
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --workspace -- --test-threads=1

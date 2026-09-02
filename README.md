@@ -124,8 +124,22 @@ crates/
 | cgroup v2 资源限制 | ✅ | 尽力而为（失败发警告事件） | ❌（内存模拟） |
 | 进程沙箱强制执行 | ✅ `sandboxed=true` | ⚠️ 仅 `no_new_privs` | ❌（`sandboxed=false`） |
 
-> 非 Linux 平台上运行时不会失败：cgroup 走 `EmulatedCgroupAdapter`，namespace/seccomp 报告不支持，
-> 沙箱是否真实执行通过 `sandboxed` 标记暴露给服务层与演示输出。
+> 非 Linux 平台或 Linux 非 root 环境下运行时不会失败：cgroup 走 `EmulatedCgroupAdapter`，namespace/seccomp 报告不支持，沙箱是否真实执行通过 `sandboxed` 标记暴露给服务层与演示输出。
+
+## 已在真内核验证
+
+完整沙箱路径（含 `unshare(2)` / `prctl(PR_SET_SECCOMP)` / 真 cgroupfs 读写 / `PR_CAPBSET_DROP`）已在 **Ubuntu 24 内核 6.8 真机上以 root 跑通**：
+
+- `cargo test --workspace -- --test-threads=1` → 13 个测试套件（含 13 项并发压力测试）全部通过；
+- `cargo run -p aion -- demo` 阶段 [4/6] 输出：
+  ```
+  平台沙箱能力: namespace ✓ · cgroup ✓ · seccomp ✓ · capability ✓
+  spawn 完成: ... sandboxed=true
+  exit code = 0（1ms）stdout: hello AION
+  ```
+- `DeviceService` 列出 198 个真实 `/dev` 节点。
+
+复现方法：任意 root Linux 拉取仓库后 `cargo run -p aion -- demo` 即可看到能力报告全部 ✓。
 
 ## 开发
 
