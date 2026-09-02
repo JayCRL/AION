@@ -190,9 +190,14 @@ impl SeccompAdapter for NativeSeccompAdapter {
 }
 
 /// 沙箱默认允许的系统调用清单（x86_64 / aarch64 通用子集）。
+///
+/// 覆盖动态链接 C 程序的完整启动路径（ld.so + glibc）：含 robust list /
+/// rseq / prlimit64 / 系统信息查询等；清单策略为「默认拒绝 + EPERM」，
+/// 实际生产工作负载应按需收紧。
 #[cfg(target_os = "linux")]
 pub fn default_allowlist() -> Vec<i64> {
     const SYS: &[i64] = &[
+        // 文件 IO
         libc::SYS_read as i64,
         libc::SYS_write as i64,
         libc::SYS_open as i64,
@@ -205,24 +210,44 @@ pub fn default_allowlist() -> Vec<i64> {
         libc::SYS_pwrite64 as i64,
         libc::SYS_readv as i64,
         libc::SYS_writev as i64,
+        libc::SYS_fcntl as i64,
+        libc::SYS_ioctl as i64,
+        libc::SYS_getdents64 as i64,
+        libc::SYS_faccessat as i64,
+        libc::SYS_faccessat2 as i64,
+        libc::SYS_readlink as i64,
+        libc::SYS_readlinkat as i64,
+        libc::SYS_statfs as i64,
+        libc::SYS_fstatfs as i64,
+        // 内存
         libc::SYS_mmap as i64,
         libc::SYS_mprotect as i64,
         libc::SYS_munmap as i64,
+        libc::SYS_mremap as i64,
+        libc::SYS_madvise as i64,
         libc::SYS_brk as i64,
+        // 信号 / 线程
         libc::SYS_rt_sigaction as i64,
         libc::SYS_rt_sigprocmask as i64,
         libc::SYS_rt_sigreturn as i64,
-        libc::SYS_ioctl as i64,
+        libc::SYS_sigaltstack as i64,
+        libc::SYS_set_robust_list as i64,
+        libc::SYS_get_robust_list as i64,
+        libc::SYS_set_tid_address as i64,
+        libc::SYS_rseq as i64,
+        libc::SYS_futex as i64,
         libc::SYS_pipe as i64,
         libc::SYS_pipe2 as i64,
         libc::SYS_dup as i64,
         libc::SYS_dup2 as i64,
         libc::SYS_dup3 as i64,
-        libc::SYS_fcntl as i64,
+        // 时间
         libc::SYS_nanosleep as i64,
         libc::SYS_clock_nanosleep as i64,
         libc::SYS_clock_gettime as i64,
         libc::SYS_gettimeofday as i64,
+        libc::SYS_time as i64,
+        // 进程 / 系统
         libc::SYS_getpid as i64,
         libc::SYS_getppid as i64,
         libc::SYS_getuid as i64,
@@ -232,17 +257,21 @@ pub fn default_allowlist() -> Vec<i64> {
         libc::SYS_gettid as i64,
         libc::SYS_uname as i64,
         libc::SYS_getrandom as i64,
-        libc::SYS_futex as i64,
-        libc::SYS_set_tid_address as i64,
+        libc::SYS_sysinfo as i64,
+        libc::SYS_sched_getaffinity as i64,
+        libc::SYS_getrusage as i64,
+        libc::SYS_prlimit64 as i64,
+        libc::SYS_getrlimit as i64,
         libc::SYS_getcwd as i64,
         libc::SYS_chdir as i64,
+        libc::SYS_arch_prctl as i64,
+        libc::SYS_prctl as i64,
+        libc::SYS_membarrier as i64,
         libc::SYS_execve as i64,
         libc::SYS_exit as i64,
         libc::SYS_exit_group as i64,
         libc::SYS_wait4 as i64,
-        libc::SYS_rseq as i64,
-        libc::SYS_prctl as i64,
-        libc::SYS_statx as i64,
+        libc::SYS_waitid as i64,
     ];
     SYS.to_vec()
 }

@@ -163,6 +163,22 @@ impl NamespaceAdapter for NativeNamespaceAdapter {
     }
 }
 
+/// 平台默认是否可以创建 namespace（用于无 root 环境的优雅降级）。
+///
+/// 非 user namespace 的 `unshare(2)` 需要 `CAP_SYS_ADMIN`（即 root/euid=0）；
+/// 无特权时调用方应跳过 namespace 隔离，仅保留 seccomp / no_new_privs 等措施。
+pub fn can_create_namespaces() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: geteuid 是无参安全查询。
+        unsafe { libc::geteuid() == 0 }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
 /// 同步版 unshare，供 `pre_exec`（fork 后、exec 前）调用。
 #[cfg(target_os = "linux")]
 pub fn unshare_raw(flags: i32) -> AdapterResult<()> {

@@ -82,6 +82,15 @@ impl ProcessService {
         }
     }
 
+    /// 发出沙箱能力降级警告事件（可观测性）。
+    async fn warn_event(&self, message: String) {
+        let ctx_opt = self.inner.handle.lock().expect("handle poisoned").clone();
+        if let Some(ctx) = ctx_opt {
+            let payload: Payload = Arc::new(message);
+            let _ = ctx.emit_with("aion:sandbox:unenforced", payload).await;
+        }
+    }
+
     /// 启动进程；`sandbox` 为 true 时应用沙箱档案。
     pub async fn spawn(
         &self,
@@ -105,9 +114,16 @@ impl ProcessService {
         let mut cgroup_handle: Option<CgroupHandle> = None;
 
         if sandbox_enabled {
-            let profile = sandbox::build_profile();
-            // 预创建 cgroup（Linux 真实 / 其他平台模拟记录）
-            if !self.inner.kit.cgroup.is_emulated() || profile.cgroup.is_some() {
+            let mut profile = sandbox::build_profile();
+            // namespace: 非 user namespace 的 unshare 需要 CAP_SYS_ADMIN（root），
+            // 无特权环境优雅降级 —— 跳过 namespace，保留 seccomp / no_new_privs。
+            let ns_ok = self.inner.kit.namespace.supported()
+                && aion_adapter::namespace::can_create_namespaces();
+            if !ns_ok {
+                profile.namespaces = aion_adapter::NamespaceSet::default();
+            }
+            // cgroup: 尽力而为；失败（如未挂载/无权限）不阻塞启动，发警告事件
+            if profile.cgroup.is_some() || !self.inner.kit.cgroup.is_emulated() {
                 let id = self.inner.next_id.load(Ordering::Relaxed);
                 let name = format!("task-{id}");
                 let default_limits = aion_adapter::CgroupLimits::new();
@@ -119,7 +135,13 @@ impl ProcessService {
                         }
                         cgroup_handle = Some(h);
                     }
-                    Err(e) => return Err(AionError::Adapter(format!("create cgroup: {e}"))),
+                    Err(e) => {
+                        self.warn_event(format!(
+                            "cgroup create failed, resource limits disabled: {e}"
+                        ))
+                        .await;
+                        cgroup_handle = None;
+                    }
                 }
             }
             spec.sandbox = Some(profile);
