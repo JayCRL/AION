@@ -15,7 +15,7 @@ pub enum ProtocolError {
     #[error("duplicate tool `{0}`")]
     DuplicateName(String),
 
-    #[error("schema mismatch for `{0}` at `{path}`: expected {expected}, got {got}", path = .path.clone())]
+    #[error("schema mismatch for `{tool}` at `{path}`: expected {expected}, got {got}")]
     SchemaMismatch {
         tool: String,
         expected: String,

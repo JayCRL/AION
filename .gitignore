@@ -16,3 +16,6 @@ aion.local.json
 # OS
 .DS_Store
 Thumbs.db
+
+# 工具临时文件（ZCode 会话草稿等）
+.zcode/
