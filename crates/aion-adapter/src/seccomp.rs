@@ -135,10 +135,10 @@ pub fn install(policy: &SeccompPolicy) -> AdapterResult<()> {
             return Err(AdapterError::Io(std::io::Error::last_os_error()));
         }
     }
-    let prog = build_filter(policy);
+    let mut prog = build_filter(policy);
     let fprog = libc::sock_fprog {
         len: prog.len() as u16,
-        filter: prog.as_ptr(),
+        filter: prog.as_mut_ptr(),
     };
     // SAFETY: fprog 指向的内存在本调用期间有效。
     unsafe {

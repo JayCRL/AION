@@ -110,11 +110,7 @@ fn device_kind_of(meta: &std::fs::Metadata) -> (DeviceKind, Option<u32>, Option<
         return (kind, None, None);
     }
     let rdev = meta.rdev();
-    (
-        kind,
-        Some(unsafe { libc::major(rdev) } as u32),
-        Some(unsafe { libc::minor(rdev) } as u32),
-    )
+    (kind, Some(libc::major(rdev) as u32), Some(libc::minor(rdev) as u32))
 }
 
 #[cfg(not(target_os = "linux"))]

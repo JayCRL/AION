@@ -1,6 +1,6 @@
 //! AION 应用层集成测试：Agent 通过 Context 使用系统服务完成任务。
 
-use aion::agents::{Agent, AgentTask};
+use aion::agents::AgentTask;
 use aion_services::SecurityContext;
 
 async fn boot_ctx() -> cordis::Context {
