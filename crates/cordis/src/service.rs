@@ -130,16 +130,14 @@ impl Registry {
         let instance: Arc<dyn Any + Send + Sync> = arc.clone();
         let service: Arc<dyn Service> = arc;
 
+        // 同名/同类型的检查与写入必须在同一临界区内完成，
+        // 否则并发 provide 会同时通过检查、后写者覆盖先写者
         let mut by_type = self.by_type_lock();
+        let mut by_name = self.by_name_lock();
         if by_type.contains_key(&type_id) {
             return Err(CordisError::ServiceAlreadyProvided(name));
         }
-        if self
-            .by_name
-            .lock()
-            .expect("registry by_name poisoned")
-            .contains_key(&name)
-        {
+        if by_name.contains_key(&name) {
             return Err(CordisError::ServiceAlreadyProvided(name));
         }
         let (state_tx, state_rx) = watch::channel(ServiceState::Pending);
@@ -156,16 +154,19 @@ impl Registry {
             start_lock: Arc::new(tokio::sync::Mutex::new(())),
         };
         by_type.insert(type_id, entry);
-        self.by_name
-            .lock()
-            .expect("registry by_name poisoned")
-            .insert(name.clone(), type_id);
+        by_name.insert(name.clone(), type_id);
+        drop(by_type);
+        drop(by_name);
         self.start_order.lock().expect("registry order poisoned").push(name);
         Ok(())
     }
 
     fn by_type_lock(&self) -> std::sync::MutexGuard<'_, HashMap<TypeId, Entry>> {
         self.by_type.lock().expect("registry by_type poisoned")
+    }
+
+    fn by_name_lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, TypeId>> {
+        self.by_name.lock().expect("registry by_name poisoned")
     }
 
     pub(crate) fn snapshot_by_type(&self, type_id: &TypeId) -> Option<EntrySnapshot> {
@@ -221,7 +222,15 @@ impl Registry {
         let Some(snap) = self.snapshot_by_name(name) else {
             return Err(CordisError::ServiceNotFound(name.to_string()));
         };
+        // 循环依赖检测必须在最前面：祖先可能正处于 Starting（已发送状态、
+        // 尚未完成依赖解析），若先走状态等待路径会互相等待造成死锁
+        if stack.iter().any(|s| s == name) {
+            return Err(CordisError::CircularDependency(name.to_string()));
+        }
         loop {
+            // 先克隆再读值：克隆会把「已见版本」固定为当前值。若先读后克隆，
+            // 可能出现「读到 Starting → 状态已变为 Started → changed() 永久等待」。
+            let mut rx = snap.state_rx.clone();
             let state = *snap.state_rx.borrow();
             match state {
                 ServiceState::Started => return Ok(()),
@@ -235,7 +244,6 @@ impl Registry {
                     return Err(CordisError::ServiceStartFailed(name.to_string(), err));
                 }
                 ServiceState::Starting | ServiceState::Stopping => {
-                    let mut rx = snap.state_rx.clone();
                     rx.changed()
                         .await
                         .map_err(|_| CordisError::Custom(format!("service `{name}` dropped")))?;
@@ -245,9 +253,6 @@ impl Registry {
             }
         }
 
-        if stack.iter().any(|s| s == name) {
-            return Err(CordisError::CircularDependency(name.to_string()));
-        }
         stack.push(name.to_string());
 
         let lock = {
@@ -256,23 +261,40 @@ impl Registry {
         };
         let _guard = lock.lock().await;
 
-        // 双重检查：可能已被其他 require 启动
+        // 双重检查：可能已被其他 require 启动或标记失败。
+        // Failed 是粘性状态：后续 require 直接返回错误，不自动重试。
         let state = *snap.state_rx.borrow();
         match state {
             ServiceState::Started => {
                 stack.pop();
                 return Ok(());
             }
-            ServiceState::Pending | ServiceState::Stopped => {}
-            ServiceState::Starting | ServiceState::Stopping | ServiceState::Failed => {}
+            ServiceState::Failed => {
+                stack.pop();
+                let err = snap
+                    .last_error
+                    .lock()
+                    .expect("last_error poisoned")
+                    .clone()
+                    .unwrap_or_default();
+                return Err(CordisError::ServiceStartFailed(name.to_string(), err));
+            }
+            // Pending / Stopped：继续启动。Starting / Stopping 理论上不会在锁内出现；
+            // 若因并发 stop 出现，重新走启动流程（require 语义 = 尽力启动）
+            _ => {}
         }
 
         let _ = snap.state_tx.send(ServiceState::Starting);
         ctx.debug(format!("service `{name}` starting"));
 
-        // 解析依赖（DI / Inject）
+        // 解析依赖（DI / Inject）；失败时必须标记 Failed，
+        // 否则服务永远停在 Starting，后续 require 会永久等待
         for dep in snap.deps.clone() {
-            Box::pin(self.ensure_started(&dep, ctx, stack)).await?;
+            if let Err(e) = Box::pin(self.ensure_started(&dep, ctx, stack)).await {
+                *snap.last_error.lock().expect("last_error poisoned") = Some(e.to_string());
+                let _ = snap.state_tx.send(ServiceState::Failed);
+                return Err(e);
+            }
         }
         stack.pop();
 
@@ -297,10 +319,24 @@ impl Registry {
     }
 
     /// 停止单个服务（幂等）。
+    ///
+    /// 若服务正处于启动中，会先等待其到达终态再停止——保证 dispose 之后
+    /// 不会残留一个「已启动但无主」的服务。
     pub(crate) async fn stop_one(&self, name: &str, ctx: &Context) -> CordisResult<()> {
         let Some(snap) = self.snapshot_by_name(name) else {
             return Ok(());
         };
+        // 等待进行中的启动完成（先克隆后读值，避免 changed() 永久等待）
+        loop {
+            let mut rx = snap.state_rx.clone();
+            let state = *snap.state_rx.borrow();
+            if state != ServiceState::Starting {
+                break;
+            }
+            rx.changed()
+                .await
+                .map_err(|_| CordisError::Custom(format!("service `{name}` dropped")))?;
+        }
         let state = *snap.state_rx.borrow();
         match state {
             ServiceState::Started => {}

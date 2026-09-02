@@ -189,6 +189,11 @@ impl Context {
         self.root.bus.subscribe_monitor()
     }
 
+    /// 当前事件监听器总数（可观测性）。
+    pub fn listener_count(&self) -> usize {
+        self.root.bus.listener_count()
+    }
+
     // ------------------------------------------------------------------
     // Fiber / Effect
     // ------------------------------------------------------------------
