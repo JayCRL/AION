@@ -1,0 +1,18 @@
+# Rust
+/target
+**/*.rs.bk
+
+# AION 运行时数据
+/var/
+
+# 本地配置
+aion.local.json
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db

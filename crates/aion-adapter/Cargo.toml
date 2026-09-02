@@ -1,0 +1,15 @@
+[package]
+name = "aion-adapter"
+description = "AION 系统适配层 — Linux Adapter: process / fs / net / cgroup / namespace / seccomp / device / capability"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+tokio.workspace = true
+thiserror.workspace = true
+async-trait.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
