@@ -1,0 +1,12 @@
+[package]
+name = "aion-protocol"
+description = "AION 协议层 — Tool / UI / Session / Event 纯数据类型（Phase 1：不含 Tool trait、不含 Registry、不依赖 cordis）"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+thiserror.workspace = true

@@ -4,6 +4,7 @@ members = [
     "crates/cordis",
     "crates/aion-adapter",
     "crates/aion-services",
+    "crates/aion-protocol",
     "crates/aion",
 ]
 
@@ -26,6 +27,7 @@ clap = { version = "4", features = ["derive"] }
 cordis = { path = "crates/cordis", version = "0.1.0" }
 aion-adapter = { path = "crates/aion-adapter", version = "0.1.0" }
 aion-services = { path = "crates/aion-services", version = "0.1.0" }
+aion-protocol = { path = "crates/aion-protocol", version = "0.1.0" }
 
 [profile.release]
 lto = "thin"
