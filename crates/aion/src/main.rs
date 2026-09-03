@@ -1,5 +1,7 @@
 //! AION CLI 入口。
 
+mod web;
+
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -37,6 +39,12 @@ enum Commands {
     Repl,
     /// 列出运行时加载的系统服务
     Services,
+    /// 启动 Web UI 服务
+    Web {
+        /// 监听端口
+        #[arg(long, default_value = "8080")]
+        port: u16,
+    },
 }
 
 #[tokio::main]
@@ -84,6 +92,9 @@ async fn main() -> anyhow::Result<()> {
             }
             ctx.dispose().await?;
             Ok(())
+        }
+        Commands::Web { port } => {
+            web::run(port).await
         }
     }
 }

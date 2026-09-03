@@ -19,3 +19,10 @@ Thumbs.db
 
 # 工具临时文件（ZCode 会话草稿等）
 .zcode/
+
+# 离线安装工具链 / vendored 依赖（不提交）
+rust-*.tar.gz
+._rust-*.tar.gz
+rustup-init
+/vendor/
+/.cargo/
