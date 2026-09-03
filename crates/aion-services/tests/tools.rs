@@ -20,13 +20,8 @@ async fn fresh_runtime() -> (cordis::Context, std::path::PathBuf) {
     let kit = AdapterKit::native(std::env::temp_dir().join(format!("aion-tools-{}", std::process::id())));
     let storage_root = std::env::temp_dir().join(format!("aion-tools-store-{}", std::process::id()));
     let services = system_services(&kit, storage_root, std::env::temp_dir());
+    // provide_all now includes ToolRegistry + ToolRuntime + 7 builtin tools
     aion_services::provide_all(&ctx, services).unwrap();
-
-    // 注入 ToolRegistry + ToolRuntime + 注册 7 个内置 Tool
-    let registry = ToolRegistry::new();
-    populate_builtin_registry(&registry).unwrap();
-    ctx.provide(registry.clone()).unwrap();
-    ctx.provide(ToolRuntime::new(std::sync::Arc::new(registry))).unwrap();
 
     let ws = std::env::temp_dir().join(format!("aion-tools-ws-{}", std::process::id()));
     tokio::fs::create_dir_all(&ws).await.unwrap();

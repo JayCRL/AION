@@ -7,12 +7,14 @@ name = "aion"
 version = "0.1.0"
 dependencies = [
  "aion-adapter",
+ "aion-protocol",
  "aion-services",
  "anyhow",
  "async-trait",
  "axum",
  "clap",
  "cordis",
+ "serde",
  "serde_json",
  "tokio",
  "tower-http",

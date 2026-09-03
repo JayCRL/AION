@@ -18,9 +18,11 @@ path = "src/main.rs"
 cordis.workspace = true
 aion-adapter.workspace = true
 aion-services.workspace = true
+aion-protocol.workspace = true
 tokio.workspace = true
 clap.workspace = true
 anyhow.workspace = true
+serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 async-trait.workspace = true
 

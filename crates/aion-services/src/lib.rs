@@ -68,6 +68,7 @@ pub fn system_services(
 }
 
 /// 把整套服务注册到 Cordis 上下文。
+/// 同时初始化 ToolRegistry + ToolRuntime 并注册 7 个内置 Tool。
 pub fn provide_all(
     ctx: &cordis::Context,
     services: SystemServices,
@@ -81,5 +82,13 @@ pub fn provide_all(
     ctx.provide(services.model)?;
     // terminal 依赖 process（通过 Service::inject 声明），放最后注册
     ctx.provide(services.terminal)?;
+
+    // Phase 2: Tool 层
+    let registry = tool::ToolRegistry::new();
+    tool::populate_builtin_registry(&registry)?;
+    let runtime = tool::ToolRuntime::new(std::sync::Arc::new(registry.clone()));
+    ctx.provide(registry)?;
+    ctx.provide(runtime)?;
+
     Ok(())
 }
