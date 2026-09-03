@@ -41,6 +41,7 @@ pub async fn run(port: u16) -> anyhow::Result<()> {
         .route("/api/health", get(api_health))
         .route("/api/tools", get(api_tools))
         .route("/api/chat", post(api_chat))
+        .route("/api/config", post(api_config))
         .route("/api/sessions", get(api_sessions).post(api_new_session))
         .layer(CorsLayer::permissive())
         .with_state(state);
@@ -216,6 +217,44 @@ fn extract_run_block(reply: &str) -> Option<String> {
     let end = rest.find("```")?;
     let cmd = rest[..end].trim().to_string();
     if cmd.is_empty() { None } else { Some(cmd) }
+}
+
+// ---------------------------------------------------------------------------
+// LLM Config API — 前端传 API key + URL + model，后端注册 OpenAiCompatBackend
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+pub struct LlmConfig {
+    pub provider: String,
+    pub api_key: String,
+    pub api_url: String,
+    pub model: String,
+}
+
+async fn api_config(
+    State(state): State<Arc<AppState>>,
+    Json(config): Json<LlmConfig>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let model_svc = state
+        .ctx
+        .require::<aion_services::model::ModelService>()
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let backend = aion_services::model::OpenAiCompatBackend::new(
+        "llm",
+        &config.api_url,
+        &config.model,
+        &config.api_key,
+    );
+    model_svc.register_backend(std::sync::Arc::new(backend), true);
+
+    Ok(Json(serde_json::json!({
+        "status": "ok",
+        "provider": config.provider,
+        "model": config.model,
+        "backend": "llm",
+    })))
 }
 
 // ---------------------------------------------------------------------------

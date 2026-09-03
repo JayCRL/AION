@@ -80,6 +80,98 @@ impl ModelBackend for EchoBackend {
     }
 }
 
+// ---------------------------------------------------------------------------
+// OpenAI 兼容后端（支持 DeepSeek / Qwen / OpenAI / 小米等）
+// ---------------------------------------------------------------------------
+
+/// OpenAI-compatible Chat API 后端。
+///
+/// 任何兼容 `POST {base_url}/chat/completions` 协议的 LLM 服务都可以接入：
+/// - DeepSeek: `https://api.deepseek.com/v1` + `deepseek-chat`
+/// - Qwen: `https://dashscope.aliyuncs.com/compatible-mode/v1` + `qwen-turbo`
+/// - OpenAI: `https://api.openai.com/v1` + `gpt-4o`
+/// - 小米 MiMo / 其他
+pub struct OpenAiCompatBackend {
+    name: String,
+    base_url: String,
+    model: String,
+    api_key: String,
+    client: reqwest::Client,
+}
+
+impl OpenAiCompatBackend {
+    pub fn new(name: impl Into<String>, base_url: impl Into<String>, model: impl Into<String>, api_key: impl Into<String>) -> Self {
+        let base_url: String = base_url.into();
+        OpenAiCompatBackend {
+            name: name.into(),
+            base_url: base_url.trim_end_matches('/').to_string(),
+            model: model.into(),
+            api_key: api_key.into(),
+            client: reqwest::Client::new(),
+        }
+    }
+}
+
+#[async_trait]
+impl ModelBackend for OpenAiCompatBackend {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    async fn chat(&self, messages: &[ChatMessage]) -> AionResult<String> {
+        let url = format!("{}/chat/completions", self.base_url);
+        let msgs: Vec<serde_json::Value> = messages
+            .iter()
+            .map(|m| serde_json::json!({"role": m.role, "content": m.content}))
+            .collect();
+
+        let body = serde_json::json!({
+            "model": self.model,
+            "messages": msgs,
+            "temperature": 0.7,
+        });
+
+        let resp = self
+            .client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .timeout(std::time::Duration::from_secs(60))
+            .send()
+            .await
+            .map_err(|e| AionError::Model(format!("LLM request failed: {e}")))?;
+
+        let status = resp.status();
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| AionError::Model(format!("LLM response read failed: {e}")))?;
+
+        if !status.is_success() {
+            return Err(AionError::Model(format!(
+                "LLM API returned {status}: {text}"
+            )));
+        }
+
+        let data: serde_json::Value = serde_json::from_str(&text)
+            .map_err(|e| AionError::Model(format!("LLM response parse failed: {e}")))?;
+
+        data.get("choices")
+            .and_then(|c| c.get(0))
+            .and_then(|c| c.get("message"))
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_str())
+            .map(|s| s.to_string())
+            .ok_or_else(|| {
+                AionError::Model(format!(
+                    "LLM response missing choices[0].message.content: {}",
+                    &text[..text.len().min(200)]
+                ))
+            })
+    }
+}
+
 /// 模型服务。
 pub struct ModelService {
     backends: RwLock<HashMap<String, Arc<dyn ModelBackend>>>,
