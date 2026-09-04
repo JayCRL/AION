@@ -38,16 +38,24 @@ pub struct SpawnedTask {
     pub ticket: ProcessTicket,
     pub stdout: Option<Box<dyn AsyncRead + Send + Unpin>>,
     pub stderr: Option<Box<dyn AsyncRead + Send + Unpin>>,
-    exit_tx: tokio::sync::broadcast::Sender<i32>,
+    /// watch 通道：值为 None 表示仍在运行，进程退出后写入 Some(code)。
+    /// watch 保留最近值，晚订阅的调用方也能立刻读到退出码（broadcast 会丢）。
+    exit_tx: tokio::sync::watch::Sender<Option<i32>>,
 }
 
 impl SpawnedTask {
     /// 等待退出码（多播：可多次调用）。
     pub fn wait(&self) -> BoxFut<i32> {
-        let tx = self.exit_tx.clone();
+        let mut rx = self.exit_tx.subscribe();
         Box::pin(async move {
-            let mut rx = tx.subscribe();
-            rx.recv().await.unwrap_or(-1)
+            loop {
+                if let Some(code) = *rx.borrow() {
+                    return code;
+                }
+                if rx.changed().await.is_err() {
+                    return -1;
+                }
+            }
         })
     }
 }
@@ -165,7 +173,8 @@ impl ProcessService {
             .expect("live map poisoned")
             .insert(id, LiveEntry { pid, cgroup: cgroup_handle.clone() });
 
-        let (exit_tx, _) = tokio::sync::broadcast::channel(1);
+        // watch 初始 None（运行中）；进程退出后 send_replace(Some(code)) 保留最近值。
+        let (exit_tx, _) = tokio::sync::watch::channel(None);
         let ticket = ProcessTicket {
             id,
             pid,
@@ -173,13 +182,13 @@ impl ProcessService {
             cgroup: cgroup_handle.as_ref().map(|c| c.name.clone()),
         };
 
-        // 退出监视 Fiber：等待退出 → 清理 cgroup → 广播退出码 → 发事件
+        // 退出监视 Fiber：等待退出 → 记录退出码 → 清理 cgroup → 发事件
         if let Some(ctx) = self.inner.handle.lock().expect("handle poisoned").clone() {
             let inner = self.inner.clone();
             let exit_tx2 = exit_tx.clone();
             ctx.spawn(format!("process:watch:{id}"), async move {
                 let code = wait.await;
-                let _ = exit_tx2.send(code);
+                let _ = exit_tx2.send_replace(Some(code));
                 if let Some(cg) = cgroup_handle {
                     let _ = inner.kit.cgroup.destroy(&cg).await;
                 }
