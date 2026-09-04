@@ -9,6 +9,7 @@
 
 pub mod file;
 pub mod process;
+pub mod risk;
 pub mod system;
 pub mod terminal;
 
@@ -168,6 +169,29 @@ impl ToolRuntime {
 
     pub fn registry(&self) -> Arc<ToolRegistry> {
         Arc::clone(&self.registry)
+    }
+
+    /// 该 ToolCall 的**有效**风险等级。
+    ///
+    /// `terminal.exec` 在定义上静态为 `High`，但 web agent 只驱动它一个工具，
+    /// 若一律按 High 处理，`ls`/`uptime` 也会弹确认框。因此对 `terminal.exec`
+    /// 用命令串启发式分类器覆盖（命中危险模式才 `High`）；其余工具直接用
+    /// 工具自己声明的 `definition().risk`。
+    ///
+    /// 这是「是否需要真人二次确认」的唯一判定入口，web 层在真正执行前调用。
+    pub fn effective_risk(&self, call: &ToolCall) -> Risk {
+        let def_risk = self
+            .registry
+            .get(&call.tool)
+            .map(|t| t.definition().risk)
+            .unwrap_or(Risk::Low);
+        if call.tool == "terminal.exec" {
+            if let Some(cmd) = call.arguments.get("command").and_then(|v| v.as_str()) {
+                return risk::classify_terminal_command(cmd);
+            }
+            return def_risk;
+        }
+        def_risk
     }
 
     /// 执行一次 ToolCall。

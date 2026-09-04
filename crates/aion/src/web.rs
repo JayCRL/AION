@@ -23,9 +23,20 @@ use tower_http::cors::CorsLayer;
 use aion_protocol::prelude::*;
 
 use aion_services::model::{ChatMessage, ModelService};
+use aion_services::security::SecurityContext;
 use aion_services::{
     backend_from_provider, LlmProtocol, LlmProvider, LlmProviderStore,
 };
+
+/// 一条等待用户确认的挂起命令（登记于 `AppState.pending`）。
+struct PendingApproval {
+    /// 用户同意后真正执行的 ToolCall（含 command 与 call_id）。
+    pub tool_call: ToolCall,
+    /// 发起它的会话。
+    pub session_id: String,
+    /// 原始命令串（用于展示 / 历史回填）。
+    pub command: String,
+}
 
 /// Web 层共享状态。
 pub struct AppState {
@@ -35,6 +46,8 @@ pub struct AppState {
     pub llm_store: Arc<LlmProviderStore>,
     /// 会话历史（内存态，Phase 3 简化版）。
     pub sessions: tokio::sync::Mutex<HashMap<String, Vec<ChatMessage>>>,
+    /// 等待用户确认的挂起动作（key = RequestId，与 UIBlock::Confirmation 配对）。
+    pending: tokio::sync::Mutex<HashMap<RequestId, PendingApproval>>,
 }
 
 /// 启动 Web 服务（先 boot cordis Runtime 再起 axum）。
@@ -67,6 +80,7 @@ pub async fn run(port: u16) -> anyhow::Result<()> {
         tool_runtime,
         llm_store,
         sessions: tokio::sync::Mutex::new(HashMap::new()),
+        pending: tokio::sync::Mutex::new(HashMap::new()),
     });
 
     let app = Router::new()
@@ -76,6 +90,7 @@ pub async fn run(port: u16) -> anyhow::Result<()> {
         .route("/api/tools", get(api_tools))
         .route("/api/chat", post(api_chat))
         .route("/api/chat/stream", post(api_chat_stream))
+        .route("/api/action", post(api_action))
         .route("/api/config", post(api_config))
         .route(
             "/api/llm/providers",
@@ -174,6 +189,16 @@ pub struct ChatRequest {
     pub session_id: Option<String>,
 }
 
+/// 用户对前端 UI 的某个 Action 做出的选择（确认 / 取消）。
+/// 与 `aion-protocol` 的 `UIAction` 同构，直接反序列化。
+///
+/// 不需要 session_id：被确认的待批命令挂在 `AppState.pending` 里，
+/// 其归属的 session 由挂起项自带。
+#[derive(Deserialize)]
+pub struct ActionRequest {
+    pub action: UIAction,
+}
+
 #[derive(Serialize)]
 pub struct ChatResponse {
     pub session_id: String,
@@ -182,6 +207,221 @@ pub struct ChatResponse {
     pub actions: Vec<serde_json::Value>,
     pub tool_calls: Vec<serde_json::Value>,
     pub tool_results: Vec<serde_json::Value>,
+}
+
+// ---------------------------------------------------------------------------
+// 同意闭环：危险命令在真正执行前弹确认框；用户同意 / 拒绝后精确恢复 / 取消。
+// 只读工具直接跑；`terminal.exec` 的高危命令串经 `effective_risk` 判定后挂起。
+// ---------------------------------------------------------------------------
+
+/// 结果是否为「等待用户确认」的挂起态。
+fn result_is_pending(r: &ToolResult) -> bool {
+    matches!(r.status, ResultStatus::Pending { .. })
+}
+
+/// 序列化一个 UIBlock。
+fn block_value(b: &UIBlock) -> serde_json::Value {
+    serde_json::to_value(b).unwrap_or(serde_json::Value::Null)
+}
+
+/// 把 ToolResult.events 携带的 UIBlock（含 Confirmation）依次写入 blocks。
+fn push_result_events(blocks: &mut Vec<serde_json::Value>, result: &ToolResult) {
+    for b in &result.events {
+        blocks.push(block_value(b));
+    }
+}
+
+/// terminal 危险命令的确认框（options = 同意[Danger] / 拒绝[Ghost]，默认拒绝）。
+fn terminal_confirm_block(request_id: &RequestId, command: &str) -> UIBlock {
+    UIBlock::Confirmation(ConfirmationBlock {
+        request_id: request_id.clone(),
+        title: "确认执行命令".into(),
+        description: format!("Agent 请求执行命令：\n\n```sh\n{command}\n```"),
+        consequences: vec![
+            "检测到高危 / 破坏性命令，执行后可能无法撤销。".to_string(),
+            "该命令可能导致数据删除、系统状态改变等不可逆结果。".to_string(),
+            "仅在完全信任时才选择「同意执行」。".to_string(),
+        ],
+        options: vec![
+            ConfirmationOption {
+                choice: "confirm".into(),
+                label: "同意执行".into(),
+                description: None,
+                style: ConfirmationStyle::Danger,
+            },
+            ConfirmationOption {
+                choice: "cancel".into(),
+                label: "拒绝".into(),
+                description: None,
+                style: ConfirmationStyle::Ghost,
+            },
+        ],
+        default_choice: "cancel".into(),
+    })
+}
+
+/// 带同意门的单步执行：
+/// - 低风险命令 → 直接执行，返回真实结果；
+/// - 高风险命令 → 登记挂起（`AppState.pending`），返回 `ResultStatus::Pending`，
+///   `events` 携带 Confirmation 块；命令此时**不会执行**。
+async fn run_consented(
+    state: &AppState,
+    ctx: &cordis::Context,
+    runtime: &aion_services::tool::ToolRuntime,
+    sec: &SecurityContext,
+    session_id: &str,
+    tc: &ToolCall,
+) -> ToolResult {
+    if !runtime.effective_risk(tc).requires_confirmation() {
+        return runtime.execute(ctx, tc.clone(), sec.clone()).await;
+    }
+    let command = tc
+        .arguments
+        .get("command")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let request_id = RequestId::new();
+    let block = terminal_confirm_block(&request_id, &command);
+    state.pending.lock().await.insert(
+        request_id.clone(),
+        PendingApproval {
+            tool_call: tc.clone(),
+            session_id: session_id.to_string(),
+            command: command.clone(),
+        },
+    );
+    ToolResult {
+        call_id: tc.call_id.clone(),
+        status: ResultStatus::Pending {
+            request_id,
+            summary: format!("等待你确认执行：{command}"),
+        },
+        data: serde_json::json!({ "command": command }),
+        artifacts: Vec::new(),
+        events: vec![block],
+    }
+}
+
+/// 一次有界「续答」循环的结果。
+struct AgenticOutcome {
+    reply_text: String,
+    blocks: Vec<serde_json::Value>,
+    tool_calls: Vec<serde_json::Value>,
+    tool_results: Vec<serde_json::Value>,
+    /// 是否因遇到待确认命令而暂停（此时 blocks 含确认框）。
+    paused: bool,
+}
+
+/// 非流式续答循环：把当前历史喂回模型，允许它继续发出 ```run 命令并自动执行，
+/// 直到模型不再发命令 / 到达 6 轮上限 / 遇到待确认命令而暂停。
+/// 返回本轮新增的正文与块，并把新消息追加进 `new_history`。
+async fn run_agentic_continuation(
+    state: &AppState,
+    ctx: &cordis::Context,
+    runtime: &aion_services::tool::ToolRuntime,
+    sec: &SecurityContext,
+    session_id: &str,
+    new_history: &mut Vec<ChatMessage>,
+) -> AgenticOutcome {
+    let model = match ctx.require::<ModelService>().await {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("model unavailable: {e}");
+            return AgenticOutcome {
+                reply_text: String::new(),
+                blocks: Vec::new(),
+                tool_calls: Vec::new(),
+                tool_results: Vec::new(),
+                paused: false,
+            };
+        }
+    };
+    let mut out = AgenticOutcome {
+        reply_text: String::new(),
+        blocks: Vec::new(),
+        tool_calls: Vec::new(),
+        tool_results: Vec::new(),
+        paused: false,
+    };
+    let mut cont = vec![ChatMessage::system(aion::agents::assistant::ASSISTANT_SYSTEM)];
+    for m in new_history.iter().rev().take(20).rev() {
+        cont.push(m.clone());
+    }
+    cont.push(ChatMessage::user(
+        "若还需要执行命令，可继续用 run 块发出（AION 会自动执行）；否则直接给出最终结论。",
+    ));
+    let mut rounds = 0usize;
+    loop {
+        rounds += 1;
+        if rounds > 6 {
+            break;
+        }
+        let fu = match model.chat(sec, None, &cont).await {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("agent followup error: {e}");
+                break;
+            }
+        };
+        let parts2 = split_run_blocks(&fu);
+        if !parts2.prose.is_empty() {
+            out.blocks.push(serde_json::json!({
+                "type": "text",
+                "markdown": parts2.prose,
+            }));
+            if out.reply_text.is_empty() {
+                out.reply_text = parts2.prose.clone();
+            } else {
+                out.reply_text = format!("{}\n\n{}", out.reply_text, parts2.prose);
+            }
+            new_history.push(ChatMessage::assistant(parts2.prose.clone()));
+        }
+        if parts2.cmds.is_empty() {
+            break;
+        }
+        for cmd in &parts2.cmds {
+            let tc = ToolCall {
+                call_id: CallId::new(),
+                tool: "terminal.exec".into(),
+                arguments: serde_json::json!({ "command": cmd }),
+                sandbox: Some(ToolSandboxHint::Default),
+            };
+            out.tool_calls.push(serde_json::json!({
+                "call_id": tc.call_id.as_str(),
+                "tool": tc.tool,
+                "arguments": tc.arguments,
+            }));
+            let result = run_consented(state, ctx, runtime, sec, session_id, &tc).await;
+            if result_is_pending(&result) {
+                push_result_events(&mut out.blocks, &result);
+                new_history.push(ChatMessage::user(format!(
+                    "命令 `{cmd}` 需要你确认后才能执行，已暂停。"
+                )));
+                out.paused = true;
+                return out;
+            }
+            let result_json = serde_json::to_value(&result).unwrap_or(serde_json::Value::Null);
+            out.tool_results.push(result_json.clone());
+            let output_text = summarize_tool_output(&result_json);
+            out.blocks.push(terminal_block(cmd, &result_json));
+            new_history.push(ChatMessage::user(format!(
+                "我发出的命令 `{cmd}` 已自动执行，输出：\n{output_text}"
+            )));
+        }
+        if new_history.len() > 40 {
+            let drop = new_history.len() - 40;
+            new_history.drain(..drop);
+        }
+        cont = vec![ChatMessage::system(aion::agents::assistant::ASSISTANT_SYSTEM)];
+        for m in new_history.iter().rev().take(20).rev() {
+            cont.push(m.clone());
+        }
+        cont.push(ChatMessage::user(
+            "若还需要执行命令，可继续用 run 块发出（AION 会自动执行）；否则直接给出最终结论。",
+        ));
+    }
+    out
 }
 
 async fn api_chat(
@@ -249,7 +489,9 @@ async fn api_chat(
     new_history.push(ChatMessage::user(req.message.clone()));
     new_history.push(ChatMessage::assistant(prose.clone()));
 
-    // 逐个执行 reply 里的 ```run 命令
+    // 逐个执行 reply 里的 ```run 命令（每个都可能触发确认暂停）
+    let mut executed_any = false;
+    let mut paused = false;
     for cmd in &parts.cmds {
         let tc = ToolCall {
             call_id: CallId::new(),
@@ -262,7 +504,16 @@ async fn api_chat(
             "tool": tc.tool,
             "arguments": tc.arguments,
         }));
-        let result = runtime.execute(&ctx, tc.clone(), sec.clone()).await;
+        let result = run_consented(&state, &ctx, &runtime, &sec, &session_id, &tc).await;
+        if result_is_pending(&result) {
+            paused = true;
+            push_result_events(&mut blocks, &result);
+            new_history.push(ChatMessage::user(format!(
+                "命令 `{cmd}` 需要你确认后才能执行，已暂停。"
+            )));
+            break;
+        }
+        executed_any = true;
         let result_json = serde_json::to_value(&result).unwrap_or(serde_json::Value::Null);
         tool_results.push(result_json.clone());
 
@@ -273,88 +524,29 @@ async fn api_chat(
         )));
     }
 
-    // Agent 闭环：有执行过命令就把真实输出回喂模型，进入有界多轮循环，
-    // 直到模型不再发 run 命令（避免续答里再发命令却不再执行、围栏泄漏进气泡）
     let mut reply_text = prose;
-    if !parts.cmds.is_empty() {
-        let model = match ctx.require::<ModelService>().await {
-            Ok(m) => m,
-            Err(e) => {
-                eprintln!("model unavailable: {e}");
-                return Err(StatusCode::INTERNAL_SERVER_ERROR);
-            }
-        };
-        let mut cont = vec![ChatMessage::system(aion::agents::assistant::ASSISTANT_SYSTEM)];
-        for m in new_history.iter().rev().take(20).rev() {
-            cont.push(m.clone());
-        }
-        cont.push(ChatMessage::user(
-            "若还需要执行命令，可继续用 run 块发出（AION 会自动执行）；否则直接给出最终结论。",
-        ));
-        let mut rounds = 0usize;
-        loop {
-            rounds += 1;
-            if rounds > 6 {
-                break;
-            }
-            let fu = match model.chat(&sec, None, &cont).await {
-                Ok(f) => f,
-                Err(e) => {
-                    eprintln!("agent followup error: {e}");
-                    break;
-                }
+    // 有真实执行过命令且未暂停 → 进入有界续答循环；模型可继续发命令直到收敛
+    if executed_any && !paused {
+        let cont = run_agentic_continuation(
+            &state,
+            &ctx,
+            &runtime,
+            &sec,
+            &session_id,
+            &mut new_history,
+        )
+        .await;
+        if !cont.reply_text.is_empty() {
+            reply_text = if reply_text.is_empty() {
+                cont.reply_text.clone()
+            } else {
+                format!("{reply_text}\n\n{}", cont.reply_text)
             };
-            let parts2 = split_run_blocks(&fu);
-            if !parts2.prose.is_empty() {
-                blocks.push(serde_json::json!({
-                    "type": "text",
-                    "markdown": parts2.prose,
-                }));
-                if reply_text.is_empty() {
-                    reply_text = parts2.prose.clone();
-                } else {
-                    reply_text = format!("{reply_text}\n\n{}", parts2.prose);
-                }
-                new_history.push(ChatMessage::assistant(parts2.prose.clone()));
-            }
-            if parts2.cmds.is_empty() {
-                break;
-            }
-            for cmd in &parts2.cmds {
-                let tc = ToolCall {
-                    call_id: CallId::new(),
-                    tool: "terminal.exec".into(),
-                    arguments: serde_json::json!({ "command": cmd }),
-                    sandbox: Some(ToolSandboxHint::Default),
-                };
-                tool_calls.push(serde_json::json!({
-                    "call_id": tc.call_id.as_str(),
-                    "tool": tc.tool,
-                    "arguments": tc.arguments,
-                }));
-                let result = runtime.execute(&ctx, tc.clone(), sec.clone()).await;
-                let result_json =
-                    serde_json::to_value(&result).unwrap_or(serde_json::Value::Null);
-                tool_results.push(result_json.clone());
-
-                let output_text = summarize_tool_output(&result_json);
-                blocks.push(terminal_block(cmd, &result_json));
-                new_history.push(ChatMessage::user(format!(
-                    "我发出的命令 `{cmd}` 已自动执行，输出：\n{output_text}"
-                )));
-            }
-            if new_history.len() > 40 {
-                let drop = new_history.len() - 40;
-                new_history.drain(..drop);
-            }
-            cont = vec![ChatMessage::system(aion::agents::assistant::ASSISTANT_SYSTEM)];
-            for m in new_history.iter().rev().take(20).rev() {
-                cont.push(m.clone());
-            }
-            cont.push(ChatMessage::user(
-                "若还需要执行命令，可继续用 run 块发出（AION 会自动执行）；否则直接给出最终结论。",
-            ));
         }
+        blocks.extend(cont.blocks);
+        tool_calls.extend(cont.tool_calls);
+        tool_results.extend(cont.tool_results);
+        // cont.paused：blocks 里已含确认框，剩余交给用户决定，无需继续喂模型
     }
 
     if new_history.len() > 40 {
@@ -366,6 +558,114 @@ async fn api_chat(
         .lock()
         .await
         .insert(session_id.clone(), new_history);
+
+    Ok(Json(ChatResponse {
+        session_id,
+        reply_text,
+        blocks,
+        actions: vec![],
+        tool_calls,
+        tool_results,
+    }))
+}
+
+/// 用户对确认框做出选择（`POST /api/action`）——同意闭环的「恢复」半边。
+///
+/// 从 `AppState.pending` 取出挂起的待批命令：
+/// - `Confirm{choice:"confirm"}`：**真正执行**那条命令，把结果写进该 session 历史，
+///   再进入续答循环让 agent 接着往下做；
+/// - `Confirm{choice:其它}` / `Cancel`：丢弃该命令，仅记「用户拒绝了操作」。
+///
+/// 返回与 `/api/chat` 相同的 `ChatResponse` 形状，前端可复用同一渲染逻辑。
+async fn api_action(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<ActionRequest>,
+) -> Result<Json<ChatResponse>, StatusCode> {
+    // 只有确认框相关的 Action 才允许在挂起表里寻址
+    let request_id = match &req.action {
+        UIAction::Confirm { request_id, .. } => request_id.clone(),
+        UIAction::Cancel { request_id } => request_id.clone(),
+        UIAction::Invoke { .. } => return Err(StatusCode::BAD_REQUEST),
+    };
+
+    // 取走挂起项：不存在 = 已处理 / 已过期
+    let approval = state
+        .pending
+        .lock()
+        .await
+        .remove(&request_id)
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    // Confirm 且选择 "confirm" 才算真正同意；其它（拒绝 / cancel）都丢弃
+    let approved = matches!(&req.action, UIAction::Confirm { choice, .. } if choice == "confirm");
+    let session_id = approval.session_id.clone();
+
+    let ctx = state.ctx.clone();
+    let runtime = state.tool_runtime.clone();
+    let sec = aion::agents::developer_sec("web-user", &[]);
+
+    let mut history: Vec<ChatMessage> = state
+        .sessions
+        .lock()
+        .await
+        .get(&session_id)
+        .cloned()
+        .unwrap_or_default();
+
+    let mut reply_text = String::new();
+    let mut blocks: Vec<serde_json::Value> = Vec::new();
+    let mut tool_calls = Vec::new();
+    let mut tool_results = Vec::new();
+
+    if approved {
+        let command = approval.command.clone();
+        let tc = approval.tool_call.clone();
+        tool_calls.push(serde_json::json!({
+            "call_id": tc.call_id.as_str(),
+            "tool": tc.tool.clone(),
+            "arguments": tc.arguments.clone(),
+        }));
+        let result = runtime.execute(&ctx, tc, sec.clone()).await;
+        let result_json = serde_json::to_value(&result).unwrap_or(serde_json::Value::Null);
+        tool_results.push(result_json.clone());
+
+        blocks.push(terminal_block(&command, &result_json));
+        let output_text = summarize_tool_output(&result_json);
+        history.push(ChatMessage::user(format!(
+            "用户已同意执行 `{command}`，输出：\n{output_text}"
+        )));
+
+        // 同意后让 agent 接着续答（可能继续发命令，也可能收尾）
+        let cont = run_agentic_continuation(
+            &state,
+            &ctx,
+            &runtime,
+            &sec,
+            &session_id,
+            &mut history,
+        )
+        .await;
+        reply_text = cont.reply_text;
+        blocks.extend(cont.blocks);
+        tool_calls.extend(cont.tool_calls);
+        tool_results.extend(cont.tool_results);
+    } else {
+        history.push(ChatMessage::user("用户拒绝了该操作，未执行。".to_string()));
+        blocks.push(serde_json::json!({
+            "type": "text",
+            "markdown": "已拒绝该操作，未执行任何命令。",
+        }));
+    }
+
+    if history.len() > 40 {
+        let drop = history.len() - 40;
+        history.drain(..drop);
+    }
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session_id.clone(), history);
 
     Ok(Json(ChatResponse {
         session_id,
@@ -572,7 +872,9 @@ async fn api_chat_stream(
         new_history.push(ChatMessage::user(input.clone()));
         new_history.push(ChatMessage::assistant(parts.prose.clone()));
 
-        // 2) 逐个执行 ```run 命令，事件实时推给前端
+        // 2) 逐个执行 ```run 命令，事件实时推给前端（可能触发确认暂停）
+        let mut executed_any = false;
+        let mut paused = false;
         for cmd in &parts.cmds {
             emit(serde_json::json!({
                 "type": "tool",
@@ -585,10 +887,20 @@ async fn api_chat_stream(
                 arguments: serde_json::json!({ "command": cmd }),
                 sandbox: Some(ToolSandboxHint::Default),
             };
-            let result = st
-                .tool_runtime
-                .execute(&st.ctx, tc.clone(), sec.clone())
-                .await;
+            let result =
+                run_consented(&st, &st.ctx, &st.tool_runtime, &sec, &session_key, &tc)
+                    .await;
+            if result_is_pending(&result) {
+                paused = true;
+                for b in &result.events {
+                    emit(block_value(b));
+                }
+                new_history.push(ChatMessage::user(format!(
+                    "命令 `{cmd}` 需要你确认后才能执行，已暂停。"
+                )));
+                break;
+            }
+            executed_any = true;
             let result_json =
                 serde_json::to_value(&result).unwrap_or(serde_json::Value::Null);
             let output_text = summarize_tool_output(&result_json);
@@ -598,9 +910,8 @@ async fn api_chat_stream(
             )));
         }
 
-        // 3) 有执行过命令 → 把真实输出回喂并进入有界 agentic 循环：
-        //    模型后续回复若仍含 ```run 命令则继续自动执行→续答，直到模型不再发命令或到达轮次上限。
-        if !parts.cmds.is_empty() {
+        // 3) 有真实执行过命令且未暂停 → 进入有界 agentic 循环。
+        if executed_any && !paused {
             let mut cont = vec![ChatMessage::system(
                 aion::agents::assistant::ASSISTANT_SYSTEM,
             )];
@@ -661,10 +972,25 @@ async fn api_chat_stream(
                         arguments: serde_json::json!({ "command": cmd }),
                         sandbox: Some(ToolSandboxHint::Default),
                     };
-                    let result = st
-                        .tool_runtime
-                        .execute(&st.ctx, tc.clone(), sec.clone())
-                        .await;
+                    let result = run_consented(
+                        &st,
+                        &st.ctx,
+                        &st.tool_runtime,
+                        &sec,
+                        &session_key,
+                        &tc,
+                    )
+                    .await;
+                    if result_is_pending(&result) {
+                        paused = true;
+                        for b in &result.events {
+                            emit(block_value(b));
+                        }
+                        new_history.push(ChatMessage::user(format!(
+                            "命令 `{cmd}` 需要你确认后才能执行，已暂停。"
+                        )));
+                        break;
+                    }
                     let result_json =
                         serde_json::to_value(&result).unwrap_or(serde_json::Value::Null);
                     let output_text = summarize_tool_output(&result_json);
@@ -672,6 +998,9 @@ async fn api_chat_stream(
                     new_history.push(ChatMessage::user(format!(
                         "我发出的命令 `{cmd}` 已自动执行，输出：\n{output_text}"
                     )));
+                }
+                if paused {
+                    break;
                 }
                 if new_history.len() > 40 {
                     let drop = new_history.len() - 40;
