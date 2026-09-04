@@ -120,15 +120,52 @@ pub async fn run(port: u16) -> anyhow::Result<()> {
 // Handlers
 // ---------------------------------------------------------------------------
 
-async fn index_handler() -> impl IntoResponse {
-    Html(include_str!("../static/index.html"))
+// ---------------------------------------------------------------------------
+// 静态资源 —— 磁盘优先、内嵌兜底
+//
+// 前端(static/index.html)不再只靠 include_str! 编译期内嵌:每次改 UI
+// 都要重编 Rust 太慢。现改为:若进程环境里有 `AION_STATIC_DIR`(指向可
+// 热更新的前端目录),就**每个请求现读磁盘文件** —— 编辑 + git pull 后
+// 立即生效,无需重编、甚至无需重启;目录缺失/读失败时回退到内嵌版本,
+// 保证二进制脱离源码树也能独立跑。
+// ---------------------------------------------------------------------------
+
+/// 编译期内嵌版本(兜底,保证自包含)。
+const EMBED_INDEX: &str = include_str!("../static/index.html");
+const EMBED_LOGO: &[u8] = include_bytes!("../static/logo.png");
+
+/// 磁盘前端目录:`AION_STATIC_DIR`,未设置返回 None(走内嵌)。
+fn static_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("AION_STATIC_DIR").map(std::path::PathBuf::from)
+}
+
+/// 读磁盘前端文件;目录未配置或文件不存在返回 None。
+async fn disk_static(name: &str) -> Option<Vec<u8>> {
+    let dir = static_dir()?;
+    match tokio::fs::read(dir.join(name)).await {
+        Ok(b) => Some(b),
+        Err(_) => None,
+    }
+}
+
+async fn index_handler() -> Response {
+    match disk_static("index.html").await {
+        Some(bytes) => {
+            let body = String::from_utf8_lossy(&bytes).into_owned();
+            Html(body).into_response()
+        }
+        None => Html(EMBED_INDEX).into_response(),
+    }
 }
 
 async fn logo_handler() -> Response {
-    let bytes = include_bytes!("../static/logo.png");
+    let bytes = match disk_static("logo.png").await {
+        Some(b) => b,
+        None => EMBED_LOGO.to_vec(),
+    };
     Response::builder()
         .header("Content-Type", "image/png")
-        .body(axum::body::Body::from(bytes.to_vec()))
+        .body(axum::body::Body::from(bytes))
         .unwrap()
 }
 
