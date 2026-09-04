@@ -11,7 +11,7 @@
 use wry::application::event::{Event, WindowEvent};
 use wry::application::event_loop::{ControlFlow, EventLoop};
 use wry::application::window::{Fullscreen, WindowBuilder};
-use wry::WebViewBuilder;
+use wry::webview::WebViewBuilder;
 
 /// AION web 后端地址(与 web 同机;若换机器改这里)。
 const AION_URL: &str = "http://127.0.0.1:18080";
@@ -26,10 +26,8 @@ fn main() -> wry::Result<()> {
     // 全屏无边框;matchbox-window-manager(会话脚本里已启动)会把单窗口铺满。
     let _ = window.set_fullscreen(Some(Fullscreen::Borderless(None)));
 
-    // 内嵌 WebKit 加载 AION。devtools 默认关,保持"只有 AION"。
-    let _webview = WebViewBuilder::new()
-        .with_url(AION_URL)?
-        .build(&window)?;
+    // 内嵌 WebKit 加载 AION。WebViewBuilder::new 按值消费 window,须在全屏设置之后。
+    let _webview = WebViewBuilder::new(window)?.with_url(AION_URL)?.build()?;
 
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Wait;
