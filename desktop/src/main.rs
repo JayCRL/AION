@@ -14,9 +14,9 @@ use wry::application::window::{Fullscreen, WindowBuilder};
 use wry::webview::WebViewBuilder;
 
 /// AION web 后端地址(与 web 同机;若换机器改这里)。
-/// `?lite=1`:桌面壳走轻量渲染 —— 关掉逐帧装饰动画与毛玻璃。
-/// 这台机器无 GPU(软渲染),那些特效会让 WebKit 渲染进程吃满一核。
-const AION_URL: &str = "http://127.0.0.1:18080/?lite=1";
+/// 不带 `?lite=1`:桌面壳开启完整动效(逐帧装饰动画 + 毛玻璃)。
+/// 注意:本机无 GPU(软渲染),特效吃 CPU;若嫌卡再回退加 `?lite=1`。
+const AION_URL: &str = "http://127.0.0.1:18080/";
 
 fn main() -> wry::Result<()> {
     let event_loop = EventLoop::new();
