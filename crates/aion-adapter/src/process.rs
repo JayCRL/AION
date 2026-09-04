@@ -240,6 +240,15 @@ fn apply_sandbox_pre_exec_impl(
     profile: &SandboxProfile,
     cgroup_path: Option<&Path>,
 ) -> crate::AdapterResult<()> {
+    // 0. 恢复 SIGPIPE 为默认处置。Rust 运行时对自身忽略 SIGPIPE，子进程经 exec
+    //    继承“忽略”，于是 `ps aux | head -6` 这类管道里，head 退出后生产者继续
+    //    写一个已无读者的管道只会得到 EPIPE 而不会死掉，进而无限阻塞到超时。
+    //    这里在 fork 后、exec 前恢复默认（终止进程），让管道行为符合 shell 语义。
+    // SAFETY: signal(SIGPIPE, SIG_DFL) 是常规信号配置，进程单线程，无竞态。
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+
     // 1. namespace 隔离
     crate::namespace::unshare_raw(profile.namespaces.flags())?;
 
