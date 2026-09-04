@@ -20,9 +20,12 @@ use std::convert::Infallible;
 use std::sync::Arc;
 use tower_http::cors::CorsLayer;
 
+use aion_protocol::llm_schema::tool_to_anthropic;
 use aion_protocol::prelude::*;
 
-use aion_services::model::{ChatMessage, ModelService};
+use aion_services::model::{
+    ChatMessage, ModelService, ToolResultBlock, ToolUseBlock,
+};
 use aion_services::security::SecurityContext;
 use aion_services::{
     backend_from_provider, LlmProtocol, LlmProvider, LlmProviderStore,
@@ -261,13 +264,6 @@ fn block_value(b: &UIBlock) -> serde_json::Value {
     serde_json::to_value(b).unwrap_or(serde_json::Value::Null)
 }
 
-/// 把 ToolResult.events 携带的 UIBlock（含 Confirmation）依次写入 blocks。
-fn push_result_events(blocks: &mut Vec<serde_json::Value>, result: &ToolResult) {
-    for b in &result.events {
-        blocks.push(block_value(b));
-    }
-}
-
 /// terminal 危险命令的确认框（options = 同意[Danger] / 拒绝[Ghost]，默认拒绝）。
 fn terminal_confirm_block(request_id: &RequestId, command: &str) -> UIBlock {
     UIBlock::Confirmation(ConfirmationBlock {
@@ -350,115 +346,476 @@ struct AgenticOutcome {
     paused: bool,
 }
 
-/// 非流式续答循环：把当前历史喂回模型，允许它继续发出 ```run 命令并自动执行，
-/// 直到模型不再发命令 / 到达 6 轮上限 / 遇到待确认命令而暂停。
-/// 返回本轮新增的正文与块，并把新消息追加进 `new_history`。
-async fn run_agentic_continuation(
+/// 组装每轮请求的 system：ASSISTANT_SYSTEM + 当前注册工具清单。
+/// 工具细节走原生 `tools` 参数；这里用一句话清单让模型先知道有什么可用。
+fn assistant_system_with_tools(runtime: &aion_services::tool::ToolRuntime) -> String {
+    let mut list = String::new();
+    for d in runtime.registry().list() {
+        list.push_str(&format!("- {}：{}\n", d.name, d.description));
+    }
+    format!(
+        "{}\n\n# 可用工具\n\
+         本次对话我已把工具以原生 `tools` 形式提供；需要查询/修改本机状态时请直接发起工具调用，\
+         不要臆造输出。\n\
+         可用工具：\n{list}\n\
+         # 回退\n\
+         若拿不到 `tools`（纯文本模式），需要执行命令时仍可用 ```run 代码块发出，AION 会自动执行并回喂输出。",
+        aion::agents::assistant::ASSISTANT_SYSTEM
+    )
+}
+
+/// 把注册表里的工具转成 Anthropic `tools` 数组（模型原生调用协议）。
+fn build_llm_tools(runtime: &aion_services::tool::ToolRuntime) -> Vec<serde_json::Value> {
+    runtime
+        .registry()
+        .list()
+        .iter()
+        .map(tool_to_anthropic)
+        .collect()
+}
+
+/// 结果是否为执行失败（error / denied）。
+fn result_is_error(result_json: &serde_json::Value) -> bool {
+    let t = result_json
+        .pointer("/status/type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    t == "error" || t == "denied"
+}
+
+/// 回喂给模型的工具输出文本。
+///
+/// `terminal.exec` 走 stdout/stderr/exit_code 摘要；结构化工具（file.list /
+/// process.list / system.stats / file.read）没有 stdout，直接把 data 压成 JSON，
+/// 让模型看得到真实内容（否则会得到空输出而无法继续）。
+fn summarize_tool_data(result_json: &serde_json::Value) -> String {
+    let data = tool_result_fields(result_json);
+    let has_term = data
+        .get("stdout")
+        .and_then(|v| v.as_str())
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false)
+        || data
+            .get("stderr")
+            .and_then(|v| v.as_str())
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false);
+    if has_term {
+        return summarize_tool_output(result_json);
+    }
+    if data.is_null()
+        || data
+            .as_object()
+            .map(|m| m.is_empty())
+            .unwrap_or(false)
+    {
+        return "(无输出)".into();
+    }
+    let s = serde_json::to_string(&data).unwrap_or_default();
+    let s: String = s.chars().take(6000).collect();
+    s
+}
+
+/// 取历史尾部最近 n 条；若开头是一条「只有 tool_result 的 user 消息」——
+/// 说明它对应的 assistant tool_use 已被裁掉，会触发 Anthropic 400，整条丢弃。
+fn recent_context(history: &[ChatMessage], n: usize) -> Vec<ChatMessage> {
+    let mut tail: Vec<&ChatMessage> = history.iter().rev().take(n).collect();
+    tail.reverse();
+    let mut i = 0;
+    while i < tail.len() && tail[i].role == "user" && !tail[i].tool_results.is_empty() {
+        i += 1;
+    }
+    tail[i..].iter().map(|m| (*m).clone()).collect()
+}
+
+/// 一次有界「原生工具」循环（三个调用点共用）：
+///
+/// 每轮用 `model.chat_turn(messages, tools)` 拿到正文 + 一串 `tool_use`，
+/// 逐个 `run_consented`（风险门 + 真人同意）执行；结果映射 UIBlock 并回填
+/// `tool_result` 进 `new_history`，再进下一轮。上限 6 轮。
+///
+/// - 无 `tool_use` 且正文含 ```run → 走旧文本回退（模型没原生工具能力时仍能跑命令）。
+/// - 无 `tool_use` 且无命令 → 最终答复，收束。
+/// - 遇到待确认的高危命令 → 挂起（返回 `paused`），保留确认块等 `/api/action` 恢复。
+/// - `tx` 为 `Some`（流式路径）时实时发 delta / seal / tool chip / 块事件；
+///   `None`（非流式 / action 恢复）只累积进返回的 `AgenticOutcome`。
+async fn run_agentic_loop(
     state: &AppState,
     ctx: &cordis::Context,
     runtime: &aion_services::tool::ToolRuntime,
     sec: &SecurityContext,
     session_id: &str,
     new_history: &mut Vec<ChatMessage>,
+    tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
 ) -> AgenticOutcome {
-    let model = match ctx.require::<ModelService>().await {
-        Ok(m) => m,
-        Err(e) => {
-            eprintln!("model unavailable: {e}");
-            return AgenticOutcome {
-                reply_text: String::new(),
-                blocks: Vec::new(),
-                tool_calls: Vec::new(),
-                tool_results: Vec::new(),
-                paused: false,
-            };
-        }
-    };
-    let mut out = AgenticOutcome {
+    let empty = || AgenticOutcome {
         reply_text: String::new(),
         blocks: Vec::new(),
         tool_calls: Vec::new(),
         tool_results: Vec::new(),
         paused: false,
     };
-    let mut cont = vec![ChatMessage::system(aion::agents::assistant::ASSISTANT_SYSTEM)];
-    for m in new_history.iter().rev().take(20).rev() {
-        cont.push(m.clone());
-    }
-    cont.push(ChatMessage::user(
-        "若还需要执行命令，可继续用 run 块发出（AION 会自动执行）；否则直接给出最终结论。",
-    ));
+    let model = match ctx.require::<ModelService>().await {
+        Ok(m) => m,
+        Err(e) => {
+            if let Some(t) = &tx {
+                let _ = t.send(
+                    serde_json::json!({ "type": "error", "message": format!("model unavailable: {e}") })
+                        .to_string(),
+                );
+            } else {
+                eprintln!("model unavailable: {e}");
+            }
+            return empty();
+        }
+    };
+    let tools = build_llm_tools(runtime);
+    let mut out = empty();
     let mut rounds = 0usize;
     loop {
         rounds += 1;
         if rounds > 6 {
             break;
         }
-        let fu = match model.chat(sec, None, &cont).await {
-            Ok(f) => f,
+        let system = ChatMessage::system(assistant_system_with_tools(runtime));
+        let recent = recent_context(new_history, 20);
+        let mut cont = Vec::with_capacity(recent.len() + 1);
+        cont.push(system);
+        cont.extend(recent);
+
+        // 文本增量转发（仅流式）
+        let (dtx, drx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let fwd = tx.as_ref().map(|outer| {
+            let outer = outer.clone();
+            tokio::spawn(async move {
+                let mut drx = drx;
+                while let Some(text) = drx.recv().await {
+                    let _ = outer.send(
+                        serde_json::json!({ "type": "delta", "text": text }).to_string(),
+                    );
+                }
+            })
+        });
+
+        let turn = match model.chat_turn(sec, None, &cont, &tools, dtx).await {
+            Ok(t) => t,
             Err(e) => {
-                eprintln!("agent followup error: {e}");
+                eprintln!("agent turn error: {e}");
+                if let Some(t) = &tx {
+                    let _ = t.send(
+                        serde_json::json!({ "type": "error", "message": format!("LLM error: {e}") })
+                            .to_string(),
+                    );
+                } else {
+                    out.blocks.push(serde_json::json!({
+                        "type": "text",
+                        "markdown": format!("⚠️ LLM error: {e}"),
+                    }));
+                }
                 break;
             }
         };
-        let parts2 = split_run_blocks(&fu);
-        if !parts2.prose.is_empty() {
-            out.blocks.push(serde_json::json!({
-                "type": "text",
-                "markdown": parts2.prose,
-            }));
-            if out.reply_text.is_empty() {
-                out.reply_text = parts2.prose.clone();
-            } else {
-                out.reply_text = format!("{}\n\n{}", out.reply_text, parts2.prose);
-            }
-            new_history.push(ChatMessage::assistant(parts2.prose.clone()));
+        if let Some(f) = fwd {
+            let _ = f.await;
         }
-        if parts2.cmds.is_empty() {
+
+        // 展示 / 存储正文 = 剥掉 ```run 的 prose
+        let rp = split_run_blocks(&turn.text);
+        let prose = rp.prose;
+        if !prose.is_empty() {
+            if let Some(t) = &tx {
+                let _ = t.send(serde_json::json!({ "type": "seal", "final": prose }).to_string());
+            }
+            out.blocks.push(serde_json::json!({ "type": "text", "markdown": prose }));
+            if out.reply_text.is_empty() {
+                out.reply_text = prose.clone();
+            } else {
+                out.reply_text = format!("{}\n\n{}", out.reply_text, prose);
+            }
+        }
+
+        // 原生 tool_use 优先；原生为空但正文里带 ```run → 文本回退
+        let mut tuses: Vec<ToolUseBlock> = turn.tool_uses;
+        if tuses.is_empty() && !rp.cmds.is_empty() {
+            tuses = rp
+                .cmds
+                .into_iter()
+                .map(|cmd| ToolUseBlock {
+                    id: CallId::new().as_str().to_string(),
+                    name: "terminal.exec".into(),
+                    input: serde_json::json!({ "command": cmd }),
+                })
+                .collect();
+        }
+        if tuses.is_empty() {
+            // 最终答复：无工具可执行
+            if !prose.is_empty() {
+                new_history.push(ChatMessage::assistant(prose));
+            }
             break;
         }
-        for cmd in &parts2.cmds {
+
+        // 逐个执行；遇待确认 → 挂起本轮（后续 tool_use 丢弃，等用户决定）
+        let mut executed: Vec<ToolUseBlock> = Vec::new();
+        let mut results: Vec<ToolResultBlock> = Vec::new();
+        let mut paused = false;
+        for tu in tuses {
+            let cmd = tu.input.get("command").and_then(|v| v.as_str()).unwrap_or_default();
+            if let Some(t) = &tx {
+                let _ = t.send(
+                    serde_json::json!({ "type": "tool", "tool": tu.name, "command": cmd })
+                        .to_string(),
+                );
+            }
             let tc = ToolCall {
                 call_id: CallId::new(),
-                tool: "terminal.exec".into(),
-                arguments: serde_json::json!({ "command": cmd }),
+                tool: tu.name.clone(),
+                arguments: tu.input.clone(),
                 sandbox: Some(ToolSandboxHint::Default),
             };
             out.tool_calls.push(serde_json::json!({
                 "call_id": tc.call_id.as_str(),
-                "tool": tc.tool,
-                "arguments": tc.arguments,
+                "tool": tc.tool.clone(),
+                "arguments": tc.arguments.clone(),
             }));
             let result = run_consented(state, ctx, runtime, sec, session_id, &tc).await;
             if result_is_pending(&result) {
-                push_result_events(&mut out.blocks, &result);
-                new_history.push(ChatMessage::user(format!(
-                    "命令 `{cmd}` 需要你确认后才能执行，已暂停。"
-                )));
-                out.paused = true;
-                return out;
+                paused = true;
+                for b in &result.events {
+                    let bv = block_value(b);
+                    out.blocks.push(bv.clone());
+                    if let Some(t) = &tx {
+                        let _ = t.send(bv.to_string());
+                    }
+                }
+                break;
             }
+            executed.push(tu.clone());
             let result_json = serde_json::to_value(&result).unwrap_or(serde_json::Value::Null);
             out.tool_results.push(result_json.clone());
-            let output_text = summarize_tool_output(&result_json);
-            out.blocks.push(terminal_block(cmd, &result_json));
-            new_history.push(ChatMessage::user(format!(
-                "我发出的命令 `{cmd}` 已自动执行，输出：\n{output_text}"
-            )));
+            for b in result_to_blocks(&tu, &result_json) {
+                out.blocks.push(b.clone());
+                if let Some(t) = &tx {
+                    let _ = t.send(b.to_string());
+                }
+            }
+            results.push(ToolResultBlock {
+                tool_use_id: tu.id.clone(),
+                content: summarize_tool_data(&result_json),
+                is_error: result_is_error(&result_json),
+            });
+        }
+
+        // 历史回填：assistant(正文 + 已执行 tool_use) → user(tool_result / 挂起说明)
+        let executed_empty = executed.is_empty();
+        if !executed_empty || !prose.is_empty() {
+            new_history.push(ChatMessage {
+                role: "assistant".into(),
+                content: prose.clone(),
+                tool_uses: executed,
+                tool_results: Vec::new(),
+            });
+        }
+        if paused {
+            new_history.push(ChatMessage {
+                role: "user".into(),
+                content: "有一个操作需要你确认后才能执行，已暂停。".into(),
+                tool_uses: Vec::new(),
+                tool_results: results,
+            });
+            out.paused = true;
+            break;
+        }
+        if !results.is_empty() {
+            new_history.push(ChatMessage {
+                role: "user".into(),
+                content: String::new(),
+                tool_uses: Vec::new(),
+                tool_results: results,
+            });
+        } else if executed_empty {
+            // 既没执行任何工具也没结果可回填——收束，避免死循环
+            break;
         }
         if new_history.len() > 40 {
             let drop = new_history.len() - 40;
             new_history.drain(..drop);
         }
-        cont = vec![ChatMessage::system(aion::agents::assistant::ASSISTANT_SYSTEM)];
-        for m in new_history.iter().rev().take(20).rev() {
-            cont.push(m.clone());
-        }
-        cont.push(ChatMessage::user(
-            "若还需要执行命令，可继续用 run 块发出（AION 会自动执行）；否则直接给出最终结论。",
-        ));
     }
     out
+}
+
+fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "K", "M", "G", "T"];
+    let mut v = bytes as f64;
+    let mut i = 0usize;
+    while v >= 1024.0 && i + 1 < UNITS.len() {
+        v /= 1024.0;
+        i += 1;
+    }
+    if i == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{v:.1}{}", UNITS[i])
+    }
+}
+
+/// ToolResult → 前端 UIBlock。terminal 归 terminal 块；file.list / process.list
+/// 出 Table；file.read / system.stats 出 text；错误给文本提示。
+fn result_to_blocks(tu: &ToolUseBlock, result_json: &serde_json::Value) -> Vec<serde_json::Value> {
+    if result_is_error(result_json) {
+        return vec![serde_json::json!({
+            "type": "text",
+            "markdown": format!("⚠️ `{}` 执行失败：{}", tu.name, summarize_tool_output(result_json)),
+        })];
+    }
+    let data = tool_result_fields(result_json);
+    match tu.name.as_str() {
+        "terminal.exec" => {
+            let command = tu
+                .input
+                .get("command")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            vec![terminal_block(command, result_json)]
+        }
+        "file.list" => {
+            let entries = data
+                .get("entries")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let headers: Vec<String> =
+                ["名称", "类型", "大小"].iter().map(|s| s.to_string()).collect();
+            let rows: Vec<serde_json::Value> = entries
+                .iter()
+                .map(|e| {
+                    let is_dir = e.get("is_dir").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let size = if is_dir {
+                        "-".to_string()
+                    } else {
+                        e.get("size")
+                            .and_then(|v| v.as_u64())
+                            .map(human_size)
+                            .unwrap_or_else(|| "-".into())
+                    };
+                    serde_json::json!([
+                        e.get("name").and_then(|v| v.as_str()).unwrap_or(""),
+                        if is_dir { "dir" } else { "file" },
+                        size,
+                    ])
+                })
+                .collect();
+            let path = data.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            vec![serde_json::json!({
+                "type": "table",
+                "headers": headers,
+                "rows": rows,
+                "caption": format!("{path} · {} 项", entries.len()),
+            })]
+        }
+        "process.list" => {
+            let procs = data
+                .get("processes")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let headers: Vec<String> = ["ticket_id", "pid", "sandboxed", "cgroup"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            let rows: Vec<serde_json::Value> = procs
+                .iter()
+                .map(|p| {
+                    serde_json::json!([
+                        p.get("ticket_id").and_then(|v| v.as_str()).unwrap_or(""),
+                        p.get("pid").and_then(|v| v.as_i64()).unwrap_or(0),
+                        p.get("sandboxed").and_then(|v| v.as_bool()).unwrap_or(false),
+                        p.get("cgroup").and_then(|v| v.as_str()).unwrap_or(""),
+                    ])
+                })
+                .collect();
+            vec![serde_json::json!({
+                "type": "table",
+                "headers": headers,
+                "rows": rows,
+                "caption": format!("{} 个进程", procs.len()),
+            })]
+        }
+        "file.read" => {
+            let content = data
+                .get("content")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let truncated = data
+                .get("truncated")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let path = data.get("path").and_then(|v| v.as_str()).unwrap_or("文件");
+            let md = if content.trim().is_empty() {
+                format!("📄 `{path}`：空文件（或不可读）")
+            } else {
+                let body: String = content.chars().take(6000).collect();
+                let mark = if truncated || content.chars().count() > 6000 {
+                    "\n…[内容已截断]"
+                } else {
+                    ""
+                };
+                format!("📄 `{path}`\n\n```\n{body}{mark}\n```")
+            };
+            vec![serde_json::json!({ "type": "text", "markdown": md })]
+        }
+        "system.stats" => {
+            let mut lines: Vec<String> = Vec::new();
+            let gb = |b: u64| format!("{:.1} GB", b as f64 / 1_073_741_824.0);
+            if let Some(m) = data.get("memory") {
+                let total = m.get("total_bytes").and_then(|v| v.as_u64()).unwrap_or(0);
+                let avail = m
+                    .get("available_bytes")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let used = total.saturating_sub(avail);
+                let pct = if total > 0 {
+                    used as f64 / total as f64 * 100.0
+                } else {
+                    0.0
+                };
+                lines.push(format!("内存：{} / {}（已用 {pct:.0}%）", gb(used), gb(total)));
+            }
+            if let Some(l) = data.get("load") {
+                let a = l.get("load1").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let b = l.get("load5").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let c = l.get("load15").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                lines.push(format!("负载：{a:.2} / {b:.2} / {c:.2}"));
+            }
+            if let Some(c) = data.get("cpu") {
+                let user = c.get("user").and_then(|v| v.as_u64()).unwrap_or(0);
+                let sys = c.get("system").and_then(|v| v.as_u64()).unwrap_or(0);
+                let idle = c.get("idle").and_then(|v| v.as_u64()).unwrap_or(0);
+                lines.push(format!("CPU ticks：user {user} / sys {sys} / idle {idle}"));
+            }
+            if let Some(u) = data.get("uptime_seconds").and_then(|v| v.as_f64()) {
+                let d = (u / 86_400.0) as u64;
+                let h = ((u % 86_400.0) / 3_600.0) as u64;
+                let m = ((u % 3_600.0) / 60.0) as u64;
+                lines.push(format!("运行时长：{d} 天 {h} 小时 {m} 分"));
+            }
+            if lines.is_empty() {
+                let pretty = serde_json::to_string_pretty(&data).unwrap_or_default();
+                lines.push(pretty);
+            }
+            vec![serde_json::json!({ "type": "text", "markdown": lines.join("\n") })]
+        }
+        _ => {
+            let pretty = serde_json::to_string_pretty(&data).unwrap_or_default();
+            let body: String = pretty.chars().take(3000).collect();
+            vec![serde_json::json!({
+                "type": "text",
+                "markdown": format!("`{}`\n```json\n{body}\n```", tu.name),
+            })]
+        }
+    }
 }
 
 async fn api_chat(
@@ -467,124 +824,32 @@ async fn api_chat(
 ) -> Result<Json<ChatResponse>, StatusCode> {
     let ctx = state.ctx.clone();
     let runtime = state.tool_runtime.clone();
-
-    let agent_impl = aion::agents::builtin()
-        .into_iter()
-        .find(|a| a.name() == "assistant")
-        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
-
     let sec = aion::agents::developer_sec("web-user", &[]);
     let session_id = req
         .session_id
         .clone()
         .unwrap_or_else(|| format!("web-{}", std::process::id()));
 
-    // 会话历史：透传给 Agent，实现多轮上下文
-    let history: Vec<ChatMessage> = state
+    // 会话历史 + 本次输入，进统一工具循环
+    let mut new_history: Vec<ChatMessage> = state
         .sessions
         .lock()
         .await
         .get(&session_id)
         .cloned()
         .unwrap_or_default();
-
-    let task = aion::agents::AgentTask {
-        kind: "chat".into(),
-        input: req.message.clone(),
-        params: serde_json::json!({
-            "history": history
-                .iter()
-                .map(|m| serde_json::json!({"role": m.role, "content": m.content}))
-                .collect::<Vec<_>>(),
-        }),
-    };
-
-    let reply = agent_impl
-        .handle(&ctx, &sec, &task)
-        .await
-        .map_err(|e| {
-            eprintln!("agent error: {e}");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-
-    let mut tool_calls = Vec::new();
-    let mut tool_results = Vec::new();
-    let mut blocks = Vec::new();
-
-    // 拆出正文与 ```run 命令：正文是唯一 bubble，命令逐个自动执行（杜绝重复渲染）
-    let parts = split_run_blocks(&reply);
-    let prose = parts.prose;
-    if !prose.is_empty() {
-        blocks.push(serde_json::json!({
-            "type": "text",
-            "markdown": prose,
-        }));
-    }
-
-    // 会话历史：user + assistant(正文)；命令执行走后续的 assistant 续答
-    let mut new_history = history;
     new_history.push(ChatMessage::user(req.message.clone()));
-    new_history.push(ChatMessage::assistant(prose.clone()));
 
-    // 逐个执行 reply 里的 ```run 命令（每个都可能触发确认暂停）
-    let mut executed_any = false;
-    let mut paused = false;
-    for cmd in &parts.cmds {
-        let tc = ToolCall {
-            call_id: CallId::new(),
-            tool: "terminal.exec".into(),
-            arguments: serde_json::json!({ "command": cmd }),
-            sandbox: Some(ToolSandboxHint::Default),
-        };
-        tool_calls.push(serde_json::json!({
-            "call_id": tc.call_id.as_str(),
-            "tool": tc.tool,
-            "arguments": tc.arguments,
-        }));
-        let result = run_consented(&state, &ctx, &runtime, &sec, &session_id, &tc).await;
-        if result_is_pending(&result) {
-            paused = true;
-            push_result_events(&mut blocks, &result);
-            new_history.push(ChatMessage::user(format!(
-                "命令 `{cmd}` 需要你确认后才能执行，已暂停。"
-            )));
-            break;
-        }
-        executed_any = true;
-        let result_json = serde_json::to_value(&result).unwrap_or(serde_json::Value::Null);
-        tool_results.push(result_json.clone());
-
-        let output_text = summarize_tool_output(&result_json);
-        blocks.push(terminal_block(cmd, &result_json));
-        new_history.push(ChatMessage::user(format!(
-            "我发出的命令 `{cmd}` 已自动执行，输出：\n{output_text}"
-        )));
-    }
-
-    let mut reply_text = prose;
-    // 有真实执行过命令且未暂停 → 进入有界续答循环；模型可继续发命令直到收敛
-    if executed_any && !paused {
-        let cont = run_agentic_continuation(
-            &state,
-            &ctx,
-            &runtime,
-            &sec,
-            &session_id,
-            &mut new_history,
-        )
-        .await;
-        if !cont.reply_text.is_empty() {
-            reply_text = if reply_text.is_empty() {
-                cont.reply_text.clone()
-            } else {
-                format!("{reply_text}\n\n{}", cont.reply_text)
-            };
-        }
-        blocks.extend(cont.blocks);
-        tool_calls.extend(cont.tool_calls);
-        tool_results.extend(cont.tool_results);
-        // cont.paused：blocks 里已含确认框，剩余交给用户决定，无需继续喂模型
-    }
+    let out = run_agentic_loop(
+        &state,
+        &ctx,
+        &runtime,
+        &sec,
+        &session_id,
+        &mut new_history,
+        None,
+    )
+    .await;
 
     if new_history.len() > 40 {
         let drop = new_history.len() - 40;
@@ -598,11 +863,11 @@ async fn api_chat(
 
     Ok(Json(ChatResponse {
         session_id,
-        reply_text,
-        blocks,
+        reply_text: out.reply_text,
+        blocks: out.blocks,
         actions: vec![],
-        tool_calls,
-        tool_results,
+        tool_calls: out.tool_calls,
+        tool_results: out.tool_results,
     }))
 }
 
@@ -672,14 +937,15 @@ async fn api_action(
             "用户已同意执行 `{command}`，输出：\n{output_text}"
         )));
 
-        // 同意后让 agent 接着续答（可能继续发命令，也可能收尾）
-        let cont = run_agentic_continuation(
+        // 同意后让 agent 接着用原生工具循环续答（可能继续调工具，也可能收尾）
+        let cont = run_agentic_loop(
             &state,
             &ctx,
             &runtime,
             &sec,
             &session_id,
             &mut history,
+            None,
         )
         .await;
         reply_text = cont.reply_text;
@@ -866,194 +1132,19 @@ async fn api_chat_stream(
             .unwrap_or_default();
         let sec = aion::agents::developer_sec("web-user", &[]);
 
-        let model = match st.ctx.require::<ModelService>().await {
-            Ok(m) => m,
-            Err(e) => {
-                emit(serde_json::json!({
-                    "type": "error",
-                    "message": format!("model unavailable: {e}")
-                }));
-                return;
-            }
-        };
-
-        // 1) 首个回答：流式增量 → delta 事件（forwarder 把模型文本包成 JSON 事件）
-        let (dtx, drx) = mpsc::unbounded_channel::<String>();
-        let outer = tx.clone();
-        let fwd = tokio::spawn(async move {
-            let mut drx = drx;
-            while let Some(text) = drx.recv().await {
-                let _ = outer.send(
-                    serde_json::json!({ "type": "delta", "text": text }).to_string(),
-                );
-            }
-        });
-        let msgs = aion::agents::assistant::chat_messages(&history, &input);
-        let reply = match model.chat_stream(&sec, None, &msgs, dtx).await {
-            Ok(r) => r,
-            Err(e) => {
-                emit(serde_json::json!({
-                    "type": "error",
-                    "message": format!("LLM error: {e}")
-                }));
-                return;
-            }
-        };
-        // dtx 已在 chat_stream 内 drop；等增量转发排空后再封口首段
-        let _ = fwd.await;
-
-        let parts = split_run_blocks(&reply);
-        emit(serde_json::json!({ "type": "seal", "final": parts.prose }));
-
+        // 统一原生工具循环：内部走 chat_turn(tools)，delta / seal / tool chip / 块事件实时推给前端
         let mut new_history = history;
         new_history.push(ChatMessage::user(input.clone()));
-        new_history.push(ChatMessage::assistant(parts.prose.clone()));
-
-        // 2) 逐个执行 ```run 命令，事件实时推给前端（可能触发确认暂停）
-        let mut executed_any = false;
-        let mut paused = false;
-        for cmd in &parts.cmds {
-            emit(serde_json::json!({
-                "type": "tool",
-                "tool": "terminal.exec",
-                "command": cmd
-            }));
-            let tc = ToolCall {
-                call_id: CallId::new(),
-                tool: "terminal.exec".into(),
-                arguments: serde_json::json!({ "command": cmd }),
-                sandbox: Some(ToolSandboxHint::Default),
-            };
-            let result =
-                run_consented(&st, &st.ctx, &st.tool_runtime, &sec, &session_key, &tc)
-                    .await;
-            if result_is_pending(&result) {
-                paused = true;
-                for b in &result.events {
-                    emit(block_value(b));
-                }
-                new_history.push(ChatMessage::user(format!(
-                    "命令 `{cmd}` 需要你确认后才能执行，已暂停。"
-                )));
-                break;
-            }
-            executed_any = true;
-            let result_json =
-                serde_json::to_value(&result).unwrap_or(serde_json::Value::Null);
-            let output_text = summarize_tool_output(&result_json);
-            emit(terminal_block(cmd, &result_json));
-            new_history.push(ChatMessage::user(format!(
-                "我发出的命令 `{cmd}` 已自动执行，输出：\n{output_text}"
-            )));
-        }
-
-        // 3) 有真实执行过命令且未暂停 → 进入有界 agentic 循环。
-        if executed_any && !paused {
-            let mut cont = vec![ChatMessage::system(
-                aion::agents::assistant::ASSISTANT_SYSTEM,
-            )];
-            for m in new_history.iter().rev().take(20).rev() {
-                cont.push(m.clone());
-            }
-            cont.push(ChatMessage::user(
-                "若还需要执行命令，可继续用 run 块发出（AION 会自动执行）；否则直接给出最终结论。",
-            ));
-            let mut rounds = 0usize;
-            loop {
-                rounds += 1;
-                if rounds > 6 {
-                    break;
-                }
-                let (dtx2, drx2) = mpsc::unbounded_channel::<String>();
-                let outer2 = tx.clone();
-                let fwd2 = tokio::spawn(async move {
-                    let mut drx2 = drx2;
-                    while let Some(text) = drx2.recv().await {
-                        let _ = outer2.send(
-                            serde_json::json!({ "type": "delta", "text": text }).to_string(),
-                        );
-                    }
-                });
-                let turn = match model.chat_stream(&sec, None, &cont, dtx2).await {
-                    Ok(t) => t,
-                    Err(e) => {
-                        emit(serde_json::json!({
-                            "type": "error",
-                            "message": format!("followup error: {e}")
-                        }));
-                        break;
-                    }
-                };
-                let _ = fwd2.await;
-
-                let parts2 = split_run_blocks(&turn);
-                if !parts2.prose.is_empty() {
-                    emit(serde_json::json!({
-                        "type": "seal",
-                        "final": parts2.prose
-                    }));
-                    new_history.push(ChatMessage::assistant(parts2.prose.clone()));
-                }
-                if parts2.cmds.is_empty() {
-                    break;
-                }
-                for cmd in &parts2.cmds {
-                    emit(serde_json::json!({
-                        "type": "tool",
-                        "tool": "terminal.exec",
-                        "command": cmd
-                    }));
-                    let tc = ToolCall {
-                        call_id: CallId::new(),
-                        tool: "terminal.exec".into(),
-                        arguments: serde_json::json!({ "command": cmd }),
-                        sandbox: Some(ToolSandboxHint::Default),
-                    };
-                    let result = run_consented(
-                        &st,
-                        &st.ctx,
-                        &st.tool_runtime,
-                        &sec,
-                        &session_key,
-                        &tc,
-                    )
-                    .await;
-                    if result_is_pending(&result) {
-                        paused = true;
-                        for b in &result.events {
-                            emit(block_value(b));
-                        }
-                        new_history.push(ChatMessage::user(format!(
-                            "命令 `{cmd}` 需要你确认后才能执行，已暂停。"
-                        )));
-                        break;
-                    }
-                    let result_json =
-                        serde_json::to_value(&result).unwrap_or(serde_json::Value::Null);
-                    let output_text = summarize_tool_output(&result_json);
-                    emit(terminal_block(cmd, &result_json));
-                    new_history.push(ChatMessage::user(format!(
-                        "我发出的命令 `{cmd}` 已自动执行，输出：\n{output_text}"
-                    )));
-                }
-                if paused {
-                    break;
-                }
-                if new_history.len() > 40 {
-                    let drop = new_history.len() - 40;
-                    new_history.drain(..drop);
-                }
-                cont = vec![ChatMessage::system(
-                    aion::agents::assistant::ASSISTANT_SYSTEM,
-                )];
-                for m in new_history.iter().rev().take(20).rev() {
-                    cont.push(m.clone());
-                }
-                cont.push(ChatMessage::user(
-                    "若还需要执行命令，可继续用 run 块发出（AION 会自动执行）；否则直接给出最终结论。",
-                ));
-            }
-        }
+        run_agentic_loop(
+            &st,
+            &st.ctx,
+            &st.tool_runtime,
+            &sec,
+            &session_key,
+            &mut new_history,
+            Some(tx.clone()),
+        )
+        .await;
 
         if new_history.len() > 40 {
             let drop = new_history.len() - 40;

@@ -39,6 +39,7 @@
 pub mod call;
 pub mod error;
 pub mod event;
+pub mod llm_schema;
 pub mod result;
 pub mod schema;
 pub mod session;

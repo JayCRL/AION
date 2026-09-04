@@ -10,24 +10,94 @@ use crate::error::{AionError, AionResult};
 use crate::security::SecurityContext;
 
 /// 一条对话消息。
-#[derive(Debug, Clone)]
+///
+/// 原生工具协议下,一条 assistant 消息可携带若干 `tool_use`,一条 user 消息可
+/// 携带若干 `tool_result`(回填上一次 tool_use 的真实输出)。纯文本后端忽略
+/// 这两组字段即可(构造器只填 `content`)。
+#[derive(Debug, Clone, Default)]
 pub struct ChatMessage {
     /// `system` / `user` / `assistant`。
     pub role: String,
+    /// 纯文本正文(无结构化块时)。有 `tool_uses` / `tool_results` 时可为空。
     pub content: String,
+    /// assistant 发出的工具调用块。
+    pub tool_uses: Vec<ToolUseBlock>,
+    /// user 回填的工具结果块(回应前面的 tool_use)。
+    pub tool_results: Vec<ToolResultBlock>,
+}
+
+/// assistant 消息里的一个工具调用块。
+#[derive(Debug, Clone)]
+pub struct ToolUseBlock {
+    /// 工具调用 ID(与 `tool_result.tool_use_id` 配对)。
+    pub id: String,
+    /// 工具名(与 `ToolDefinition.name` 一致)。
+    pub name: String,
+    /// 按工具 schema 生成的参数。
+    pub input: serde_json::Value,
+}
+
+/// user 消息里回填工具结果的一个块。
+#[derive(Debug, Clone)]
+pub struct ToolResultBlock {
+    /// 回应哪个 `tool_use`。
+    pub tool_use_id: String,
+    /// 工具输出的文本形式。
+    pub content: String,
+    /// 是否执行出错(前端/模型据此判断继续或中止)。
+    pub is_error: bool,
+}
+
+/// 一轮模型对话的产物:正文文本 + 可选的工具调用列表。
+#[derive(Debug, Clone, Default)]
+pub struct AgentTurn {
+    pub text: String,
+    pub tool_uses: Vec<ToolUseBlock>,
 }
 
 impl ChatMessage {
     pub fn system(content: impl Into<String>) -> Self {
-        ChatMessage { role: "system".into(), content: content.into() }
+        ChatMessage {
+            role: "system".into(),
+            content: content.into(),
+            ..Default::default()
+        }
     }
 
     pub fn user(content: impl Into<String>) -> Self {
-        ChatMessage { role: "user".into(), content: content.into() }
+        ChatMessage {
+            role: "user".into(),
+            content: content.into(),
+            ..Default::default()
+        }
+    }
+
+    /// 携带一个工具结果的 user 消息(纯文本后端只看到空正文)。
+    pub fn user_tool_result(block: ToolResultBlock) -> Self {
+        ChatMessage {
+            role: "user".into(),
+            content: String::new(),
+            tool_results: vec![block],
+            ..Default::default()
+        }
     }
 
     pub fn assistant(content: impl Into<String>) -> Self {
-        ChatMessage { role: "assistant".into(), content: content.into() }
+        ChatMessage {
+            role: "assistant".into(),
+            content: content.into(),
+            ..Default::default()
+        }
+    }
+
+    /// 携带若干 tool_use 的 assistant 消息(正文可为空)。
+    pub fn assistant_tool_uses(tool_uses: Vec<ToolUseBlock>) -> Self {
+        ChatMessage {
+            role: "assistant".into(),
+            content: String::new(),
+            tool_uses,
+            ..Default::default()
+        }
     }
 }
 
@@ -50,6 +120,24 @@ pub trait ModelBackend: Send + Sync {
             let _ = tx.send(full.clone());
         }
         Ok(full)
+    }
+
+    /// 原生工具对话：携带 `tools` 参数调用模型，解析 `tool_use` 并回填 `tool_result`。
+    ///
+    /// 默认实现退化为纯文本(无视 `tools`，`tool_uses` 恒空)——Echo 等纯文本后端
+    /// 不破。只有能理解工具协议的后端(Anthropic / 支持 function-calling 的
+    /// OpenAI-compat)才需要覆盖。
+    async fn chat_turn(
+        &self,
+        _messages: &[ChatMessage],
+        _tools: &[serde_json::Value],
+        _tx: tokio::sync::mpsc::UnboundedSender<String>,
+    ) -> AionResult<AgentTurn> {
+        let text = self.chat(_messages).await?;
+        Ok(AgentTurn {
+            text,
+            tool_uses: Vec::new(),
+        })
     }
 }
 
@@ -328,6 +416,88 @@ fn merge_anthropic_messages(msgs: Vec<(String, String)>) -> Vec<(String, String)
     out
 }
 
+/// 把 AION `ChatMessage` 组装成 Anthropic `messages`(支持 tool_use/tool_result 块)。
+///
+/// 返回 `(system 拼接串, messages)`。与旧 `merge_anthropic_messages`(纯文本、粗暴
+/// 同角色拼接)不同:带结构块的 message 必须**逐条**保留(Anthropic 要求 tool_result
+/// 紧跟对应 assistant tool_use,不能合并),故只合并两侧都是纯文本的相邻同角色消息。
+fn build_anthropic_messages(
+    messages: &[ChatMessage],
+) -> (String, Vec<serde_json::Value>) {
+    let mut system_parts: Vec<String> = Vec::new();
+    let mut out: Vec<serde_json::Value> = Vec::new();
+
+    let mut last_role: Option<&str> = None;
+    for m in messages {
+        if m.role == "system" {
+            if !m.content.is_empty() {
+                system_parts.push(m.content.clone());
+            }
+            continue;
+        }
+        let role: &str = if m.role == "user" { "user" } else { "assistant" };
+        let mut blocks: Vec<serde_json::Value> = Vec::new();
+        if !m.content.trim().is_empty() {
+            blocks.push(serde_json::json!({ "type": "text", "text": m.content }));
+        }
+        for tu in &m.tool_uses {
+            blocks.push(serde_json::json!({
+                "type": "tool_use",
+                "id": tu.id,
+                "name": tu.name,
+                "input": tu.input,
+            }));
+        }
+        for tr in &m.tool_results {
+            blocks.push(serde_json::json!({
+                "type": "tool_result",
+                "tool_use_id": tr.tool_use_id,
+                "content": tr.content,
+                "is_error": tr.is_error,
+            }));
+        }
+        // 纯文本相邻同角色才合并(否则各自独立成消息,保序)。仅当上一条消息的
+        // content 是纯字符串(单 text)才拼接;若上一条已带 tool 块则不可合并。
+        let mut merged = false;
+        if blocks.len() == 1
+            && blocks[0].get("type").and_then(|t| t.as_str()) == Some("text")
+            && last_role == Some(role)
+        {
+            if let Some(last) = out.last_mut() {
+                let cur = last
+                    .get("content")
+                    .and_then(|c| c.as_str())
+                    .map(|s| s.to_string());
+                if let Some(cur) = cur {
+                    let add = blocks[0]["text"].as_str().unwrap_or("");
+                    last["content"] = serde_json::Value::String(format!("{cur}\n\n{add}"));
+                    merged = true;
+                }
+            }
+        }
+        if merged {
+            continue;
+        }
+        // 全是 text 的单消息 → content 用字符串(兼容最宽松的 Anthropic 实现)。
+        let content: serde_json::Value = if blocks.len() == 1
+            && blocks[0].get("type").and_then(|t| t.as_str()) == Some("text")
+        {
+            serde_json::json!(blocks[0]["text"].as_str().unwrap_or(""))
+        } else {
+            serde_json::Value::Array(blocks)
+        };
+        out.push(serde_json::json!({ "role": role, "content": content }));
+        last_role = Some(role);
+    }
+    if out.first().map(|m| m.get("role").and_then(|r| r.as_str())) != Some(Some("user")) {
+        out.insert(
+            0,
+            serde_json::json!({ "role": "user", "content": "(继续)" }),
+        );
+    }
+    (system_parts.join("\n\n"), out)
+}
+
 /// Anthropic Messages API 后端。
 ///
 /// 任何兼容 `POST {base_url}/v1/messages` 协议的 LLM 服务都可以接入：
@@ -549,6 +719,158 @@ impl ModelBackend for AnthropicCompatBackend {
         }
         Ok(full)
     }
+
+    /// 原生工具对话(Anthropic 消息含 content 块数组 + `tools` 参数)。
+    ///
+    /// 流式解析三类事件:
+    /// - `content_block_start` type=text → 后续 text_delta 逐 token 送 `tx`;
+    /// - type=tool_use → 记下 id/name;
+    /// - `input_json_delta` → 逐片拼接该 tool_use 的 `input` JSON(跨 chunk 分片)。
+    /// 结束后把每个 tool_use 的拼接串解析成 `Value`。
+    async fn chat_turn(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[serde_json::Value],
+        tx: tokio::sync::mpsc::UnboundedSender<String>,
+    ) -> AionResult<AgentTurn> {
+        ensure_http_scheme(&self.base_url)?;
+        let (system, msgs) = build_anthropic_messages(messages);
+        let mut body = serde_json::json!({
+            "model": self.model,
+            "max_tokens": self.max_tokens,
+            "messages": msgs,
+            "stream": true,
+        });
+        if !system.is_empty() {
+            body["system"] = serde_json::Value::String(system);
+        }
+        if !tools.is_empty() {
+            body["tools"] = serde_json::Value::Array(tools.to_vec());
+        }
+
+        let resp = self
+            .client
+            .post(self.endpoint())
+            .header("x-api-key", &self.api_key)
+            .header("anthropic-version", "2023-06-01")
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .timeout(std::time::Duration::from_secs(180))
+            .send()
+            .await
+            .map_err(|e| AionError::Model(format!("LLM request failed: {e}")))?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp
+                .text()
+                .await
+                .map_err(|e| AionError::Model(format!("LLM error read failed: {e}")))?;
+            return Err(AionError::Model(format!(
+                "LLM API returned {status}: {text}"
+            )));
+        }
+
+        // 按 content block index 累积进行中的 tool_use。
+        struct Acc {
+            id: String,
+            name: String,
+            json: String,
+            /// 最后一次「拼接串整体可解析」时的值——兼容部分服务把整段 JSON 当
+            /// partial_json 反复下发（拼接会失败）的情况；最终优先整体解析。
+            fallback: Option<serde_json::Value>,
+        }
+        let mut accs: std::collections::HashMap<u64, Acc> = std::collections::HashMap::new();
+        let mut order: Vec<u64> = Vec::new();
+        let mut full = String::new();
+
+        read_sse_stream(resp.bytes_stream(), |payload| {
+            let v: serde_json::Value = serde_json::from_str(&payload)
+                .map_err(|e| AionError::Model(format!("bad SSE json: {e}: {payload}")))?;
+            let ev = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            match ev {
+                "content_block_start" => {
+                    let idx = v.get("index").and_then(|i| i.as_u64()).unwrap_or(0);
+                    let blk = v.get("content_block").cloned().unwrap_or(serde_json::Value::Null);
+                    let btype = blk.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                    if btype == "tool_use" {
+                        let raw_id = blk
+                            .get("id")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or_default()
+                            .to_string();
+                        // 个别 Anthropic 兼容实现不带 id——给个确定性的合成 id，
+                        // 否则后面 tool_result 无法配对。
+                        let id = if raw_id.is_empty() {
+                            format!("toolu_{idx}")
+                        } else {
+                            raw_id
+                        };
+                        let name = blk
+                            .get("name")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or_default()
+                            .to_string();
+                        if accs
+                            .insert(idx, Acc { id, name, json: String::new(), fallback: None })
+                            .is_none()
+                        {
+                            order.push(idx);
+                        }
+                    }
+                }
+                "content_block_delta" => {
+                    let idx = v.get("index").and_then(|i| i.as_u64()).unwrap_or(0);
+                    let dt = v.pointer("/delta/type").and_then(|t| t.as_str()).unwrap_or("");
+                    if dt == "text_delta" {
+                        if let Some(text) = v.pointer("/delta/text").and_then(|t| t.as_str()) {
+                            full.push_str(text);
+                            let _ = tx.send(text.to_string());
+                        }
+                    } else if dt == "input_json_delta" {
+                        if let Some(seg) = v
+                            .pointer("/delta/partial_json")
+                            .and_then(|t| t.as_str())
+                        {
+                            if let Some(a) = accs.get_mut(&idx) {
+                                a.json.push_str(seg);
+                                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&a.json)
+                                {
+                                    a.fallback = Some(parsed);
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+            Ok(())
+        })
+        .await?;
+
+        let mut tool_uses: Vec<ToolUseBlock> = Vec::new();
+        for idx in order {
+            if let Some(a) = accs.remove(&idx) {
+                let input = if a.json.trim().is_empty() {
+                    serde_json::json!({})
+                } else {
+                    serde_json::from_str(&a.json)
+                        .ok()
+                        .or(a.fallback)
+                        .unwrap_or_else(|| serde_json::json!({ "_raw": a.json }))
+                };
+                tool_uses.push(ToolUseBlock {
+                    id: a.id,
+                    name: a.name,
+                    input,
+                });
+            }
+        }
+        Ok(AgentTurn {
+            text: full,
+            tool_uses,
+        })
+    }
 }
 
 /// 模型服务。
@@ -623,6 +945,20 @@ impl ModelService {
         sec.check_cap("model:use")?;
         let backend = self.pick(backend)?;
         backend.chat_stream(messages, tx).await
+    }
+
+    /// 原生工具对话：携带 `tools` 调用模型，解析 `tool_use` 并回填 `tool_result`。
+    pub async fn chat_turn(
+        &self,
+        sec: &SecurityContext,
+        backend: Option<&str>,
+        messages: &[ChatMessage],
+        tools: &[serde_json::Value],
+        tx: tokio::sync::mpsc::UnboundedSender<String>,
+    ) -> AionResult<AgentTurn> {
+        sec.check_cap("model:use")?;
+        let backend = self.pick(backend)?;
+        backend.chat_turn(messages, tools, tx).await
     }
 
     /// 已注册的后端列表。
