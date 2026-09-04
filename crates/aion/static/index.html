@@ -18,6 +18,13 @@ body{font-family:'Inter',-apple-system,sans-serif;background:var(--bg);color:var
 .stars{position:fixed;inset:0;pointer-events:none;z-index:0}
 .stars::before{content:'';position:absolute;inset:0;background:radial-gradient(1px 1px at 20% 30%,#fff4,transparent),radial-gradient(1px 1px at 80% 20%,#fff3,transparent),radial-gradient(1px 1px at 50% 70%,#fff2,transparent),radial-gradient(ellipse at 50% 100%,var(--acc-glow) 0%,transparent 60%);animation:starDrift 30s linear infinite}
 @keyframes starDrift{0%{transform:translateY(0)}100%{transform:translateY(-20px)}}
+/* 桌面 lite(?lite=1,软渲染/无GPU 下加载):逐帧动画与毛玻璃在 WebKit 非合成模式
+   下会变成"每帧全屏软件重绘",吃满一核。此模式下全部关掉;浏览器保持全特效。 */
+body.lite .stars::before{animation:none}
+body.lite .logo-img,body.lite .logo-ring{animation:none}
+body.lite .logo-text{opacity:1;animation:none}
+body.lite *{-webkit-backdrop-filter:none!important;backdrop-filter:none!important}
+body.lite .input-box{background:rgba(255,255,255,.09);border-color:rgba(255,255,255,.16)}
 
 /* ── logo ── */
 .logo-wrap{position:fixed;z-index:10;display:flex;flex-direction:column;align-items:center;gap:16px;transition:all .8s cubic-bezier(.4,0,.2,1)}
@@ -156,7 +163,7 @@ body{font-family:'Inter',-apple-system,sans-serif;background:var(--bg);color:var
 @keyframes bnc{0%,60%,100%{transform:translateY(0)}30%{transform:translateY(-6px)}}
 </style>
 </head>
-<body class="state-landing">
+<body class="state-landing"><script>if(location.search.indexOf('lite')>-1)document.body.classList.add('lite')</script>
 <div class="stars"></div>
 
 <!-- logo -->
