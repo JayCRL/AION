@@ -82,6 +82,7 @@ impl TerminalService {
 
         let task = proc.spawn(sec, spec, true).await?;
         let id = task.ticket.id;
+        let pid = task.ticket.pid;
         let sandboxed = task.ticket.sandboxed;
         let wait_fut = task.wait();
         let SpawnedTaskParts { stdout, stderr } = SpawnedTaskParts {
@@ -89,10 +90,12 @@ impl TerminalService {
             stderr: task.stderr,
         };
 
+        eprintln!("[term:{id}] spawned pid={pid:?} sandboxed={sandboxed}");
         let start = Instant::now();
         let run = async move {
             let mut out_buf = Vec::new();
             let mut err_buf = Vec::new();
+            let mut read_done = false;
             let f1 = async {
                 if let Some(mut r) = stdout {
                     let _ = r.read_to_end(&mut out_buf).await;
@@ -104,12 +107,20 @@ impl TerminalService {
                 }
             };
             let (_, _) = tokio::join!(f1, f2);
+            read_done = true;
+            eprintln!(
+                "[term:{id}] pipes EOF after {:.1}s (out={}B err={}B)",
+                start.elapsed().as_secs_f64(),
+                out_buf.len(),
+                err_buf.len()
+            );
             let code = wait_fut.await;
-            (out_buf, err_buf, code)
+            eprintln!("[term:{id}] wait resolved code={code} after {:.1}s", start.elapsed().as_secs_f64());
+            (out_buf, err_buf, code, read_done)
         };
 
         match tokio::time::timeout(timeout, run).await {
-            Ok((out_buf, err_buf, code)) => Ok(TerminalOutcome {
+            Ok((out_buf, err_buf, code, _)) => Ok(TerminalOutcome {
                 id,
                 code,
                 stdout: String::from_utf8_lossy(&out_buf).into_owned(),
@@ -119,6 +130,7 @@ impl TerminalService {
                 timed_out: false,
             }),
             Err(_) => {
+                eprintln!("[term:{id}] TIMEOUT after {:.1}s", start.elapsed().as_secs_f64());
                 // 超时：终止进程
                 let _ = proc.kill(sec, id, 9).await;
                 Ok(TerminalOutcome {
