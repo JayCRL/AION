@@ -267,32 +267,7 @@ async fn api_chat(
         tool_results.push(result_json.clone());
 
         let output_text = summarize_tool_output(&result_json);
-        let stdout = result_json
-            .get("stdout")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string();
-        let stderr = result_json
-            .get("stderr")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string();
-        let code = result_json
-            .get("exit_code")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(-1);
-        let timed_out = result_json
-            .get("timed_out")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        blocks.push(serde_json::json!({
-            "type": "terminal",
-            "command": cmd,
-            "output": stdout,
-            "stderr": stderr,
-            "code": code,
-            "timed_out": timed_out,
-        }));
+        blocks.push(terminal_block(cmd, &result_json));
         new_history.push(ChatMessage::user(format!(
             "我发出的命令 `{cmd}` 已自动执行，输出：\n{output_text}"
         )));
@@ -363,32 +338,7 @@ async fn api_chat(
                 tool_results.push(result_json.clone());
 
                 let output_text = summarize_tool_output(&result_json);
-                let stdout = result_json
-                    .get("stdout")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string();
-                let stderr = result_json
-                    .get("stderr")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string();
-                let code = result_json
-                    .get("exit_code")
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(-1);
-                let timed_out = result_json
-                    .get("timed_out")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                blocks.push(serde_json::json!({
-                    "type": "terminal",
-                    "command": cmd,
-                    "output": stdout,
-                    "stderr": stderr,
-                    "code": code,
-                    "timed_out": timed_out,
-                }));
+                blocks.push(terminal_block(cmd, &result_json));
                 new_history.push(ChatMessage::user(format!(
                     "我发出的命令 `{cmd}` 已自动执行，输出：\n{output_text}"
                 )));
@@ -427,20 +377,58 @@ async fn api_chat(
     }))
 }
 
+/// ToolResult 序列化后形如 {"status":{...},"data":{...}}：成功载荷在 data 内，
+/// 失败载荷在 status.message。这里取回真正承载结果的 data；error/denied 时把
+/// 原因塞进 stderr 兜底，避免上层把“执行失败”误读成“静默无输出”。
+fn tool_result_fields(result_json: &serde_json::Value) -> serde_json::Value {
+    let data = result_json
+        .get("data")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let status = result_json.get("status");
+    let status_type = status
+        .and_then(|s| s.get("type"))
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    if status_type == "error" || status_type == "denied" {
+        let msg = status
+            .and_then(|s| s.get("message"))
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let mut d = data;
+        if !msg.is_empty() {
+            match &mut d {
+                serde_json::Value::Object(map) => {
+                    map.insert(
+                        "stderr".into(),
+                        serde_json::json!(format!("tool {status_type}: {msg}")),
+                    );
+                }
+                _ => {
+                    d = serde_json::json!({ "stderr": format!("tool {status_type}: {msg}") });
+                }
+            }
+        }
+        return d;
+    }
+    data
+}
+
 /// 把 ToolResult 的关键字段压缩成一段可回喂模型的文本。
 fn summarize_tool_output(result_json: &serde_json::Value) -> String {
+    let data = tool_result_fields(result_json);
     let mut parts: Vec<String> = Vec::new();
-    if let Some(so) = result_json.get("stdout").and_then(|v| v.as_str()) {
+    if let Some(so) = data.get("stdout").and_then(|v| v.as_str()) {
         if !so.trim().is_empty() {
             parts.push(format!("stdout:\n{so}"));
         }
     }
-    if let Some(se) = result_json.get("stderr").and_then(|v| v.as_str()) {
+    if let Some(se) = data.get("stderr").and_then(|v| v.as_str()) {
         if !se.trim().is_empty() {
             parts.push(format!("stderr:\n{se}"));
         }
     }
-    if let Some(code) = result_json.get("exit_code").and_then(|v| v.as_i64()) {
+    if let Some(code) = data.get("exit_code").and_then(|v| v.as_i64()) {
         parts.push(format!("exit_code: {code}"));
     }
     if parts.is_empty() {
@@ -448,6 +436,19 @@ fn summarize_tool_output(result_json: &serde_json::Value) -> String {
     } else {
         parts.join("\n")
     }
+}
+
+/// 渲染一条 terminal UI 块（命令 + 真实 stdout/stderr/退出码）。
+fn terminal_block(command: &str, result_json: &serde_json::Value) -> serde_json::Value {
+    let data = tool_result_fields(result_json);
+    serde_json::json!({
+        "type": "terminal",
+        "command": command,
+        "output": data.get("stdout").and_then(|v| v.as_str()).unwrap_or_default(),
+        "stderr": data.get("stderr").and_then(|v| v.as_str()).unwrap_or_default(),
+        "code": data.get("exit_code").and_then(|v| v.as_i64()).unwrap_or(-1),
+        "timed_out": data.get("timed_out").and_then(|v| v.as_bool()).unwrap_or(false),
+    })
 }
 
 /// 拆 `reply` 的产物：正文 + 一组 ```run 命令。
@@ -591,32 +592,7 @@ async fn api_chat_stream(
             let result_json =
                 serde_json::to_value(&result).unwrap_or(serde_json::Value::Null);
             let output_text = summarize_tool_output(&result_json);
-            let stdout = result_json
-                .get("stdout")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string();
-            let stderr = result_json
-                .get("stderr")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string();
-            let code = result_json
-                .get("exit_code")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(-1);
-            let timed_out = result_json
-                .get("timed_out")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            emit(serde_json::json!({
-                "type": "terminal",
-                "command": cmd,
-                "output": stdout,
-                "stderr": stderr,
-                "code": code,
-                "timed_out": timed_out,
-            }));
+            emit(terminal_block(cmd, &result_json));
             new_history.push(ChatMessage::user(format!(
                 "我发出的命令 `{cmd}` 已自动执行，输出：\n{output_text}"
             )));
@@ -692,32 +668,7 @@ async fn api_chat_stream(
                     let result_json =
                         serde_json::to_value(&result).unwrap_or(serde_json::Value::Null);
                     let output_text = summarize_tool_output(&result_json);
-                    let stdout = result_json
-                        .get("stdout")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default()
-                        .to_string();
-                    let stderr = result_json
-                        .get("stderr")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default()
-                        .to_string();
-                    let code = result_json
-                        .get("exit_code")
-                        .and_then(|v| v.as_i64())
-                        .unwrap_or(-1);
-                    let timed_out = result_json
-                        .get("timed_out")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false);
-                    emit(serde_json::json!({
-                        "type": "terminal",
-                        "command": cmd,
-                        "output": stdout,
-                        "stderr": stderr,
-                        "code": code,
-                        "timed_out": timed_out,
-                    }));
+                    emit(terminal_block(cmd, &result_json));
                     new_history.push(ChatMessage::user(format!(
                         "我发出的命令 `{cmd}` 已自动执行，输出：\n{output_text}"
                     )));
