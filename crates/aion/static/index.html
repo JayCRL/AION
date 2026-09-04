@@ -83,7 +83,10 @@ body{font-family:'Inter',-apple-system,sans-serif;background:var(--bg);color:var
 .blk-tbl td{padding:8px 10px;border-bottom:1px solid var(--glass-brd)}
 .blk-cfm{background:var(--bg2);border:1px solid var(--warn);border-radius:var(--r);padding:14px;margin:8px 0}
 .blk-cfm .t{font-weight:600;color:var(--warn);margin-bottom:8px;font-size:14px}
-.blk-cfm .btns{display:flex;gap:8px;margin-top:12px}
+.blk-cfm .cfm-desc{margin:10px 0;white-space:pre-wrap;word-break:break-word}
+.blk-cfm .cfm-cons{color:var(--err);font-size:12.5px;line-height:1.7;padding-left:2px}
+.blk-cfm .btns{display:flex;gap:8px;margin-top:14px}
+.blk-cfm button[disabled]{opacity:.5;cursor:default}
 .btn{padding:7px 18px;border-radius:8px;border:none;cursor:pointer;font-size:13px;font-weight:500;transition:opacity .2s}
 .btn:hover{opacity:.8}
 .btn-p{background:var(--acc);color:#fff}
@@ -521,9 +524,9 @@ function onSSE(ev){
       removeTyping();openBubble=null;openAcc='';
       appendChip('🔧 '+(ev.tool||'tool')+(ev.command?' → $ '+ev.command:''));
       break;
-    case'terminal':
+    case'terminal':case'confirmation':case'table':case'file':case'image':
       removeTyping();openBubble=null;openAcc='';
-      appendTerminal(ev);
+      appendBlock(ev);
       break;
     case'error':
       removeTyping();openBubble=null;openAcc='';
@@ -550,6 +553,14 @@ function appendChip(text){
 function appendTerminal(b){
   let d=document.createElement('div');d.className='msg assistant';
   d.innerHTML=renderBlock({type:'terminal',command:b.command,output:b.output,stderr:b.stderr,code:b.code,timed_out:b.timed_out});
+  chatArea.appendChild(d);scrollBtm();
+}
+// 通用整块渲染：terminal / confirmation / table / file / image 事件走这里
+function appendBlock(b){
+  let html=renderBlock(b);
+  if(!html)return;
+  let d=document.createElement('div');d.className='msg assistant';
+  d.innerHTML=html;
   chatArea.appendChild(d);scrollBtm();
 }
 
@@ -613,16 +624,37 @@ function renderTable(b){
   return html+'</table>';
 }
 
+var CONFIRM_STYLE={primary:'btn-p',danger:'btn-d',ghost:'btn-g'};
 function renderConfirm(b){
-  let html='<div class="blk-cfm"><div class="t">⚠️ '+esc(b.title||'Confirm')+'</div><div style="font-size:13px;color:var(--txt2)">'+esc(b.description||'')+'</div><div class="btns">';
+  let map=CONFIRM_STYLE,html='<div class="blk-cfm"><div class="t">⚠️ '+esc(b.title||'需要你的确认')+'</div>';
+  if(b.description)html+='<div class="cfm-desc">'+esc(b.description).replace(/\n/g,'<br>')+'</div>';
+  (b.consequences||[]).forEach(function(c){html+='<div class="cfm-cons">• '+esc(c)+'</div>'});
+  html+='<div class="btns">';
   (b.options||[]).forEach(function(o){
-    html+='<button class="btn btn-'+(o.style||'g')+'" onclick="confirmAction(\''+b.request_id+'\',\''+o.choice+'\')">'+esc(o.label)+'</button>';
+    html+='<button class="btn '+(map[o.style]||'btn-g')+'" data-rid="'+esc(b.request_id)+'" data-choice="'+esc(o.choice)+'" onclick="confirmAction(this)">'+esc(o.label)+'</button>';
   });
   return html+'</div></div>';
 }
 
-async function confirmAction(rid,choice){
-  await sendRaw({message:'__confirm__',tool_call:{tool:'system.continue',arguments:{request_id:rid,choice:choice}}});
+// 用户点同意/拒绝 → 走 POST /api/action 恢复那次被挂起的工具调用
+async function confirmAction(btn){
+  let rid=btn.getAttribute('data-rid'),choice=btn.getAttribute('data-choice');
+  let group=btn.parentNode.querySelectorAll('button');
+  group.forEach(function(x){x.disabled=true});
+  let action=choice==='confirm'
+    ?{kind:'confirm',request_id:rid,choice:choice}
+    :{kind:'cancel',request_id:rid};
+  try{
+    let r=await fetch('/api/action',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:currentSession||undefined,action:action})});
+    let data=await r.json();
+    if(!r.ok)throw new Error(data.error||('HTTP '+r.status));
+    if(data.session_id)currentSession=data.session_id;
+    addAssistantMsg(data.reply_text||'',data.blocks||[]);
+    scrollBtm();
+  }catch(e){
+    group.forEach(function(x){x.disabled=false});
+    addAssistantMsg('⚠️ '+(e.message||'action 失败'),[]);
+  }
 }
 
 // settings

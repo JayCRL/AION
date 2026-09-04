@@ -1,0 +1,19 @@
+# AION Desktop — 原生桌面壳(独立工程,不在主 workspace 内)
+#
+# 用 WebKit 内嵌加载本机 AION web(127.0.0.1:18080),全屏无浏览器外观。
+# 只在 Linux 目标编译(mac/Windows 上 `cargo build` 不会碰它)。
+# 需要系统包:libwebkit2gtk-4.0-dev libgtk-3-dev(pkg-config 能找到 webkit2gtk-4.0)。
+[package]
+name = "aion-desktop"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+# 自带空 workspace 表 → 自成 workspace,不被 AION 根 workspace 收录,
+# 也不会拖累 mac 上的主工程构建。
+[workspace]
+
+[dependencies]
+# wry 0.24 系 → 对应 webkit2gtk-4.0(GTK3),匹配 Ubuntu 22.04。
+# 更高版本(wry 0.3x+)改用 webkit2gtk-4.1,Ubuntu 22.04 仓库里没有,故锁在此。
+wry = "0.24"
