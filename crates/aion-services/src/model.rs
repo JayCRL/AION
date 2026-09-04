@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
+use futures::StreamExt;
 
 use crate::error::{AionError, AionResult};
 use crate::security::SecurityContext;
@@ -36,6 +37,20 @@ pub trait ModelBackend: Send + Sync {
     fn name(&self) -> &str;
 
     async fn chat(&self, messages: &[ChatMessage]) -> AionResult<String>;
+
+    /// 流式对话：文本增量经 `tx` 实时送出，返回完整文本。
+    /// 后端可覆盖以逐 token 推送；默认实现退化为一次性整段返回。
+    async fn chat_stream(
+        &self,
+        messages: &[ChatMessage],
+        tx: tokio::sync::mpsc::UnboundedSender<String>,
+    ) -> AionResult<String> {
+        let full = self.chat(messages).await?;
+        if !full.is_empty() {
+            let _ = tx.send(full.clone());
+        }
+        Ok(full)
+    }
 }
 
 /// 内置离线后端：确定性的回声响应（便于测试与演示，无需网络）。
@@ -78,6 +93,39 @@ impl ModelBackend for EchoBackend {
              提示：这是离线 Echo 后端；通过 ModelService::register_backend 可接入真实 LLM。"
         ))
     }
+}
+
+/// 逐块消费一条 SSE 字节流：按 `\n` 切行，凡以 `data:` 开头（非 `[DONE]`、
+/// 非注释/空行）的载荷都会回调 `on_data`。跨 chunk 的半行会留在缓冲区等待补齐。
+async fn read_sse_stream<S, B>(
+    mut stream: S,
+    mut on_data: impl FnMut(String) -> AionResult<()>,
+) -> AionResult<()>
+where
+    S: futures::Stream<Item = Result<B, reqwest::Error>> + Unpin,
+    B: AsRef<[u8]>,
+{
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| AionError::Model(format!("LLM stream read error: {e}")))?;
+        buf.extend_from_slice(chunk.as_ref());
+        loop {
+            let Some(pos) = buf.iter().position(|&b| b == b'\n') else { break };
+            let raw: Vec<u8> = buf.drain(..=pos).collect();
+            let mut line = String::from_utf8_lossy(&raw[..raw.len() - 1]).into_owned();
+            while line.ends_with('\r') {
+                line.pop();
+            }
+            if let Some(payload) = line.strip_prefix("data:") {
+                let payload = payload.trim();
+                if payload == "[DONE]" || payload.is_empty() {
+                    continue;
+                }
+                on_data(payload.to_string())?;
+            }
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -170,6 +218,68 @@ impl ModelBackend for OpenAiCompatBackend {
                     &text[..text.len().min(200)]
                 ))
             })
+    }
+
+    async fn chat_stream(
+        &self,
+        messages: &[ChatMessage],
+        tx: tokio::sync::mpsc::UnboundedSender<String>,
+    ) -> AionResult<String> {
+        ensure_http_scheme(&self.base_url)?;
+        let url = format!("{}/chat/completions", self.base_url);
+        let msgs: Vec<serde_json::Value> = messages
+            .iter()
+            .map(|m| serde_json::json!({"role": m.role, "content": m.content}))
+            .collect();
+
+        let body = serde_json::json!({
+            "model": self.model,
+            "messages": msgs,
+            "temperature": 0.7,
+            "stream": true,
+        });
+
+        let resp = self
+            .client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .timeout(std::time::Duration::from_secs(120))
+            .send()
+            .await
+            .map_err(|e| AionError::Model(format!("LLM request failed: {e}")))?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp
+                .text()
+                .await
+                .map_err(|e| AionError::Model(format!("LLM error read failed: {e}")))?;
+            return Err(AionError::Model(format!(
+                "LLM API returned {status}: {text}"
+            )));
+        }
+
+        let mut full = String::new();
+        read_sse_stream(resp.bytes_stream(), |payload| {
+            let v: serde_json::Value = serde_json::from_str(&payload)
+                .map_err(|e| AionError::Model(format!("bad SSE json: {e}: {payload}")))?;
+            if let Some(delta) = v
+                .pointer("/choices/0/delta/content")
+                .and_then(|c| c.as_str())
+            {
+                full.push_str(delta);
+                let _ = tx.send(delta.to_string());
+            }
+            Ok(())
+        })
+        .await?;
+
+        if full.trim().is_empty() {
+            return Err(AionError::Model("LLM returned empty streamed reply".into()));
+        }
+        Ok(full)
     }
 }
 
@@ -358,6 +468,87 @@ impl ModelBackend for AnthropicCompatBackend {
             }
         }
     }
+
+    async fn chat_stream(
+        &self,
+        messages: &[ChatMessage],
+        tx: tokio::sync::mpsc::UnboundedSender<String>,
+    ) -> AionResult<String> {
+        ensure_http_scheme(&self.base_url)?;
+        let mut system_parts: Vec<String> = Vec::new();
+        let mut pairs: Vec<(String, String)> = Vec::new();
+        for m in messages {
+            match m.role.as_str() {
+                "system" => system_parts.push(m.content.clone()),
+                "user" => pairs.push(("user".into(), m.content.clone())),
+                _ => pairs.push(("assistant".into(), m.content.clone())),
+            }
+        }
+        let msgs: Vec<serde_json::Value> = merge_anthropic_messages(pairs)
+            .into_iter()
+            .map(|(role, content)| serde_json::json!({"role": role, "content": content}))
+            .collect();
+
+        let mut body = serde_json::json!({
+            "model": self.model,
+            "max_tokens": self.max_tokens,
+            "messages": msgs,
+            "stream": true,
+        });
+        if !system_parts.is_empty() {
+            body["system"] = serde_json::Value::String(system_parts.join("\n\n"));
+        }
+
+        let resp = self
+            .client
+            .post(self.endpoint())
+            .header("x-api-key", &self.api_key)
+            .header("anthropic-version", "2023-06-01")
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .timeout(std::time::Duration::from_secs(120))
+            .send()
+            .await
+            .map_err(|e| AionError::Model(format!("LLM request failed: {e}")))?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp
+                .text()
+                .await
+                .map_err(|e| AionError::Model(format!("LLM error read failed: {e}")))?;
+            return Err(AionError::Model(format!(
+                "LLM API returned {status}: {text}"
+            )));
+        }
+
+        // 流式事件：只取 content_block_delta 里的 text_delta；thinking/signature 块跳过。
+        let mut full = String::new();
+        read_sse_stream(resp.bytes_stream(), |payload| {
+            let v: serde_json::Value = serde_json::from_str(&payload)
+                .map_err(|e| AionError::Model(format!("bad SSE json: {e}: {payload}")))?;
+            let ev = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            if ev == "content_block_delta" {
+                let dt = v
+                    .pointer("/delta/type")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("");
+                if dt == "text_delta" {
+                    if let Some(text) = v.pointer("/delta/text").and_then(|t| t.as_str()) {
+                        full.push_str(text);
+                        let _ = tx.send(text.to_string());
+                    }
+                }
+            }
+            Ok(())
+        })
+        .await?;
+
+        if full.trim().is_empty() {
+            return Err(AionError::Model("LLM returned empty streamed reply".into()));
+        }
+        Ok(full)
+    }
 }
 
 /// 模型服务。
@@ -419,6 +610,19 @@ impl ModelService {
         sec.check_cap("model:use")?;
         let backend = self.pick(backend)?;
         backend.chat(messages).await
+    }
+
+    /// 发起流式对话：文本增量经 `tx` 实时送出，返回完整文本。
+    pub async fn chat_stream(
+        &self,
+        sec: &SecurityContext,
+        backend: Option<&str>,
+        messages: &[ChatMessage],
+        tx: tokio::sync::mpsc::UnboundedSender<String>,
+    ) -> AionResult<String> {
+        sec.check_cap("model:use")?;
+        let backend = self.pick(backend)?;
+        backend.chat_stream(messages, tx).await
     }
 
     /// 已注册的后端列表。

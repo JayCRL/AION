@@ -20,6 +20,7 @@ aion-adapter.workspace = true
 aion-services.workspace = true
 aion-protocol.workspace = true
 tokio.workspace = true
+futures.workspace = true
 clap.workspace = true
 anyhow.workspace = true
 serde = { workspace = true, features = ["derive"] }

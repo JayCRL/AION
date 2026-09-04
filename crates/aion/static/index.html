@@ -70,6 +70,10 @@ body{font-family:'Inter',-apple-system,sans-serif;background:var(--bg);color:var
 /* ── blocks ── */
 .blk-term{background:#050505;border:1px solid rgba(255,255,255,.06);border-radius:10px;padding:12px 14px;font-family:monospace;font-size:13px;margin:8px 0;overflow-x:auto;white-space:pre-wrap;color:#c9d1d9}
 .blk-term .pr{color:var(--ok)}
+.blk-term .term-cmd{color:#8b949e;margin-bottom:4px}
+.blk-term .term-out{white-space:pre-wrap;word-break:break-word;margin:0}
+.blk-term .term-tag{margin-top:4px;font-size:11px;color:#8b949e}
+.msg.typing-holder{padding:2px 6px}
 .blk-stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:8px;margin:8px 0}
 .stat{background:var(--bg2);border:1px solid var(--glass-brd);border-radius:10px;padding:12px;text-align:center}
 .stat-v{font-size:20px;font-weight:600;color:var(--acc)}
@@ -224,6 +228,9 @@ let $=function(s){return document.querySelector(s)};
 let chatArea=document.getElementById('chatArea');
 let input=document.getElementById('msgInput');
 let inChatMode=false;
+let currentSession=null;
+let streamBusy=false;
+let openBubble=null, openAcc='';
 let PROV_PRESETS={
   zhipu:{protocol:'anthropic',url:'https://open.bigmodel.cn/api/anthropic',model:'glm-5.3-flash'},
   deepseek:{protocol:'openai',url:'https://api.deepseek.com/v1',model:'deepseek-chat'},
@@ -428,36 +435,122 @@ function enterChatMode(){
 // send
 async function send(){
   let text=input.value.trim();
-  if(!text)return;
+  if(!text||streamBusy)return;
   input.value='';
   enterChatMode();
   addUserMsg(text);
   await sendRaw({message:text});
 }
 
+function addTyping(){
+  let t=document.createElement('div');t.className='msg assistant typing-holder';
+  t.innerHTML='<div class="typing-dots"><span></span><span></span><span></span></div>';
+  chatArea.appendChild(t);scrollBtm();
+}
+function removeTyping(){let t=chatArea.querySelector('.typing-holder');if(t)t.remove()}
+
+// 走 SSE 流式端点；会话 ID 跨轮保持，服务端不可用时回退一次性 /api/chat
 async function sendRaw(body){
-  let typing=document.createElement('div');
-  typing.className='msg assistant';
-  typing.innerHTML='<div class="typing-dots"><span></span><span></span><span></span></div>';
-  chatArea.appendChild(typing);scrollBtm();
+  if(streamBusy)return;
+  streamBusy=true;
+  if(currentSession&&!body.session_id)body=Object.assign({},body,{session_id:currentSession});
+  openBubble=null;openAcc='';
+  addTyping();
   try{
-    let resp=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-    if(!resp.ok)throw new Error('HTTP '+resp.status);
-    let data=await resp.json();
-    typing.remove();
-    addAssistantMsg(data.reply_text||'',data.blocks||[]);
-    if(data.tool_calls&&data.tool_calls.length){
-      data.tool_calls.forEach(function(tc){
-        let d=document.createElement('div');d.className='msg assistant';
-        d.innerHTML='<div class="bubble" style="font-family:monospace;font-size:12px;color:var(--txt2)">🔧 '+esc(tc.tool)+' → '+esc(JSON.stringify(tc.arguments).substring(0,80))+'</div>';
-        chatArea.appendChild(d);
-      });
-      scrollBtm();
-    }
+    let resp=await fetch('/api/chat/stream',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    if(!resp.ok||!resp.body)throw new Error('HTTP '+resp.status);
+    await consumeSSE(resp);
   }catch(e){
-    typing.remove();
-    addAssistantMsg('⚠️ '+e.message);
+    removeTyping();openBubble=null;openAcc='';
+    try{
+      let r2=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+      if(!r2.ok)throw new Error('HTTP '+r2.status);
+      let data=await r2.json();
+      removeTyping();
+      addAssistantMsg(data.reply_text||'',data.blocks||[]);
+    }catch(e2){
+      removeTyping();
+      addAssistantMsg('⚠️ '+(e2.message||'error'));
+    }
+  }finally{streamBusy=false;removeTyping()}
+}
+
+async function consumeSSE(resp){
+  const reader=resp.body.getReader();
+  const dec=new TextDecoder();
+  let buf='';
+  for(;;){
+    const {done,value}=await reader.read();
+    if(done)break;
+    buf+=dec.decode(value,{stream:true});
+    let nl;
+    while((nl=buf.indexOf('\n'))>=0){
+      let line=buf.slice(0,nl);buf=buf.slice(nl+1);
+      if(line.charAt(line.length-1)==='\r')line=line.slice(0,-1);
+      if(line.slice(0,5)!=='data:')continue;
+      let payload=line.slice(5);
+      if(payload.charAt(0)===' ')payload=payload.slice(1);
+      if(!payload)continue;
+      let ev;try{ev=JSON.parse(payload)}catch(err){continue}
+      onSSE(ev);
+    }
   }
+}
+
+function onSSE(ev){
+  switch(ev.type){
+    case'start':
+      if(ev.session_id)currentSession=ev.session_id;
+      break;
+    case'delta':
+      removeTyping();
+      if(!openBubble){openBubble=makeStreamBubble();openAcc=''}
+      openAcc+=(ev.text||'');
+      openBubble.querySelector('.bubble').innerHTML=md(openAcc);
+      scrollBtm();
+      break;
+    case'seal':
+      removeTyping();
+      if(openBubble){
+        if(ev.final!==undefined&&ev.final!==null&&ev.final!=='')
+          openBubble.querySelector('.bubble').innerHTML=md(ev.final);
+        openBubble=null;openAcc='';
+      }
+      break;
+    case'tool':
+      removeTyping();openBubble=null;openAcc='';
+      appendChip('🔧 '+(ev.tool||'tool')+(ev.command?' → $ '+ev.command:''));
+      break;
+    case'terminal':
+      removeTyping();openBubble=null;openAcc='';
+      appendTerminal(ev);
+      break;
+    case'error':
+      removeTyping();openBubble=null;openAcc='';
+      addAssistantMsg('⚠️ '+(ev.message||'error'));
+      break;
+    case'done':
+      removeTyping();openBubble=null;openAcc='';
+      if(ev.session_id)currentSession=ev.session_id;
+      break;
+  }
+}
+
+function makeStreamBubble(){
+  let d=document.createElement('div');d.className='msg assistant';
+  d.innerHTML='<div class="bubble"></div>';
+  chatArea.appendChild(d);scrollBtm();
+  return d;
+}
+function appendChip(text){
+  let d=document.createElement('div');d.className='msg assistant';
+  d.innerHTML='<div class="bubble" style="font-family:monospace;font-size:12px;color:var(--txt2);padding:8px 14px">'+esc(text)+'</div>';
+  chatArea.appendChild(d);scrollBtm();
+}
+function appendTerminal(b){
+  let d=document.createElement('div');d.className='msg assistant';
+  d.innerHTML=renderBlock({type:'terminal',command:b.command,output:b.output,stderr:b.stderr,code:b.code,timed_out:b.timed_out});
+  chatArea.appendChild(d);scrollBtm();
 }
 
 function addUserMsg(text){
@@ -466,20 +559,36 @@ function addUserMsg(text){
   chatArea.appendChild(d);scrollBtm();
 }
 
+// blocks 是唯一渲染源：每个 text 块 = 一个气泡，terminal 独立成块 —— 不再叠加 reply_text
 function addAssistantMsg(reply,blocks){
+  let bs=(blocks&&blocks.length)?blocks:(reply?[{type:'text',markdown:reply}]:[]);
+  let html=bs.map(renderBlock).join('');
+  if(!html)return;
   let d=document.createElement('div');d.className='msg assistant';
-  let blkHtml='';
-  (blocks||[]).forEach(function(b){blkHtml+=renderBlock(b)});
-  d.innerHTML='<div><div class="bubble">'+md(reply)+'</div>'+blkHtml+'</div>';
+  d.innerHTML=html;
   chatArea.appendChild(d);scrollBtm();
 }
 
 function renderBlock(b){
   if(!b||!b.type)return'';
   switch(b.type){
-    case'text':return'<div class="bubble" style="padding:8px 0;border:none;background:none">'+md(b.markdown||'')+'</div>';
-    case'terminal':
-      return'<div class="blk-term"><span class="pr">$</span> '+esc(b.output||'')+'</div>';
+    case'text':return'<div class="bubble">'+md(b.markdown||'')+'</div>';
+    case'terminal':{
+      let h='<div class="blk-term">';
+      if(b.command)h+='<div class="term-cmd"><span class="pr">$</span> '+esc(b.command)+'</div>';
+      let hasOut=b.output&&b.output.trim();
+      let hasErr=b.stderr&&b.stderr.trim();
+      if(hasOut)h+='<pre class="term-out">'+esc(b.output)+'</pre>';
+      if(hasErr)h+='<pre class="term-out" style="color:#f85149">'+esc(b.stderr)+'</pre>';
+      if(!hasOut&&!hasErr)h+='<pre class="term-out">(无输出)</pre>';
+      let tag='';
+      if(b.timed_out)tag='⏱ 执行超时';
+      else if(b.code===0||b.code===null||b.code===undefined)tag='✓ exit 0';
+      else if(b.code===-1)tag='';
+      else tag='exit '+b.code;
+      if(tag)h+='<div class="term-tag">'+tag+'</div>';
+      return h+'</div>';
+    }
     case'table':return renderTable(b);
     case'confirmation':return renderConfirm(b);
     default:return'';

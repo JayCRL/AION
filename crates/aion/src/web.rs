@@ -6,18 +6,23 @@
 use axum::{
     extract::{Path, State},
     http::StatusCode,
-    response::{Html, IntoResponse, Response},
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        Html, IntoResponse, Response,
+    },
     routing::{delete, get, post},
     Json, Router,
 };
+use futures::stream as fstream;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::sync::Arc;
 use tower_http::cors::CorsLayer;
 
 use aion_protocol::prelude::*;
 
-use aion_services::model::ChatMessage;
+use aion_services::model::{ChatMessage, ModelService};
 use aion_services::{
     backend_from_provider, LlmProtocol, LlmProvider, LlmProviderStore,
 };
@@ -70,6 +75,7 @@ pub async fn run(port: u16) -> anyhow::Result<()> {
         .route("/api/health", get(api_health))
         .route("/api/tools", get(api_tools))
         .route("/api/chat", post(api_chat))
+        .route("/api/chat/stream", post(api_chat_stream))
         .route("/api/config", post(api_config))
         .route(
             "/api/llm/providers",
@@ -227,75 +233,184 @@ async fn api_chat(
     let mut tool_calls = Vec::new();
     let mut tool_results = Vec::new();
     let mut blocks = Vec::new();
-    let mut reply_text = reply.clone();
 
-    blocks.push(serde_json::json!({
-        "type": "text",
-        "markdown": reply,
-    }));
-
-    // 更新会话历史（user + assistant），超出上限保留最近 40 条
-    let mut new_history = history;
-    new_history.push(ChatMessage::user(req.message.clone()));
-    new_history.push(ChatMessage::assistant(reply.clone()));
-    if new_history.len() > 40 {
-        let drop = new_history.len() - 40;
-        new_history.drain(..drop);
+    // 拆出正文与 ```run 命令：正文是唯一 bubble，命令逐个自动执行（杜绝重复渲染）
+    let parts = split_run_blocks(&reply);
+    let prose = parts.prose;
+    if !prose.is_empty() {
+        blocks.push(serde_json::json!({
+            "type": "text",
+            "markdown": prose,
+        }));
     }
 
-    // Phase 3 简化：检测 reply 里的 ```run ... ``` 块并执行
-    if let Some(cmd) = extract_run_block(&reply) {
+    // 会话历史：user + assistant(正文)；命令执行走后续的 assistant 续答
+    let mut new_history = history;
+    new_history.push(ChatMessage::user(req.message.clone()));
+    new_history.push(ChatMessage::assistant(prose.clone()));
+
+    // 逐个执行 reply 里的 ```run 命令
+    for cmd in &parts.cmds {
         let tc = ToolCall {
             call_id: CallId::new(),
             tool: "terminal.exec".into(),
             arguments: serde_json::json!({ "command": cmd }),
             sandbox: Some(ToolSandboxHint::Default),
         };
-        let result = runtime.execute(&ctx, tc.clone(), sec.clone()).await;
         tool_calls.push(serde_json::json!({
             "call_id": tc.call_id.as_str(),
             "tool": tc.tool,
             "arguments": tc.arguments,
         }));
+        let result = runtime.execute(&ctx, tc.clone(), sec.clone()).await;
         let result_json = serde_json::to_value(&result).unwrap_or(serde_json::Value::Null);
         tool_results.push(result_json.clone());
-        let stdout = result
-            .data
+
+        let output_text = summarize_tool_output(&result_json);
+        let stdout = result_json
             .get("stdout")
             .and_then(|v| v.as_str())
-            .unwrap_or_default();
-        if !stdout.is_empty() {
-            blocks.push(serde_json::json!({
-                "type": "terminal",
-                "tool_call_id": tc.call_id.as_str(),
-                "kind": "exec",
-                "output": stdout,
-            }));
-        }
+            .unwrap_or_default()
+            .to_string();
+        let stderr = result_json
+            .get("stderr")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let code = result_json
+            .get("exit_code")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(-1);
+        let timed_out = result_json
+            .get("timed_out")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        blocks.push(serde_json::json!({
+            "type": "terminal",
+            "command": cmd,
+            "output": stdout,
+            "stderr": stderr,
+            "code": code,
+            "timed_out": timed_out,
+        }));
+        new_history.push(ChatMessage::user(format!(
+            "我发出的命令 `{cmd}` 已自动执行，输出：\n{output_text}"
+        )));
+    }
 
-        // Agent 闭环：把真实执行结果回喂模型，基于输出继续回答
-        let output_text = summarize_tool_output(&result_json);
-        match continue_after_tool(&ctx, &sec, &new_history, &output_text).await {
-            Ok(followup) if !followup.trim().is_empty() => {
+    // Agent 闭环：有执行过命令就把真实输出回喂模型，进入有界多轮循环，
+    // 直到模型不再发 run 命令（避免续答里再发命令却不再执行、围栏泄漏进气泡）
+    let mut reply_text = prose;
+    if !parts.cmds.is_empty() {
+        let model = match ctx.require::<ModelService>().await {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("model unavailable: {e}");
+                return Err(StatusCode::INTERNAL_SERVER_ERROR);
+            }
+        };
+        let mut cont = vec![ChatMessage::system(aion::agents::assistant::ASSISTANT_SYSTEM)];
+        for m in new_history.iter().rev().take(20).rev() {
+            cont.push(m.clone());
+        }
+        cont.push(ChatMessage::user(
+            "若还需要执行命令，可继续用 run 块发出（AION 会自动执行）；否则直接给出最终结论。",
+        ));
+        let mut rounds = 0usize;
+        loop {
+            rounds += 1;
+            if rounds > 6 {
+                break;
+            }
+            let fu = match model.chat(&sec, None, &cont).await {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!("agent followup error: {e}");
+                    break;
+                }
+            };
+            let parts2 = split_run_blocks(&fu);
+            if !parts2.prose.is_empty() {
                 blocks.push(serde_json::json!({
                     "type": "text",
-                    "markdown": followup,
+                    "markdown": parts2.prose,
                 }));
-                reply_text = format!("{reply}\n\n{followup}");
-                new_history.push(ChatMessage::user(format!(
-                    "我上一条回复发起的命令已执行，输出如下：\n{output_text}"
-                )));
-                new_history.push(ChatMessage::assistant(followup));
-                if new_history.len() > 40 {
-                    let drop = new_history.len() - 40;
-                    new_history.drain(..drop);
+                if reply_text.is_empty() {
+                    reply_text = parts2.prose.clone();
+                } else {
+                    reply_text = format!("{reply_text}\n\n{}", parts2.prose);
                 }
+                new_history.push(ChatMessage::assistant(parts2.prose.clone()));
             }
-            Ok(_) => {}
-            Err(e) => eprintln!("continue_after_tool error: {e}"),
+            if parts2.cmds.is_empty() {
+                break;
+            }
+            for cmd in &parts2.cmds {
+                let tc = ToolCall {
+                    call_id: CallId::new(),
+                    tool: "terminal.exec".into(),
+                    arguments: serde_json::json!({ "command": cmd }),
+                    sandbox: Some(ToolSandboxHint::Default),
+                };
+                tool_calls.push(serde_json::json!({
+                    "call_id": tc.call_id.as_str(),
+                    "tool": tc.tool,
+                    "arguments": tc.arguments,
+                }));
+                let result = runtime.execute(&ctx, tc.clone(), sec.clone()).await;
+                let result_json =
+                    serde_json::to_value(&result).unwrap_or(serde_json::Value::Null);
+                tool_results.push(result_json.clone());
+
+                let output_text = summarize_tool_output(&result_json);
+                let stdout = result_json
+                    .get("stdout")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let stderr = result_json
+                    .get("stderr")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let code = result_json
+                    .get("exit_code")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(-1);
+                let timed_out = result_json
+                    .get("timed_out")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                blocks.push(serde_json::json!({
+                    "type": "terminal",
+                    "command": cmd,
+                    "output": stdout,
+                    "stderr": stderr,
+                    "code": code,
+                    "timed_out": timed_out,
+                }));
+                new_history.push(ChatMessage::user(format!(
+                    "我发出的命令 `{cmd}` 已自动执行，输出：\n{output_text}"
+                )));
+            }
+            if new_history.len() > 40 {
+                let drop = new_history.len() - 40;
+                new_history.drain(..drop);
+            }
+            cont = vec![ChatMessage::system(aion::agents::assistant::ASSISTANT_SYSTEM)];
+            for m in new_history.iter().rev().take(20).rev() {
+                cont.push(m.clone());
+            }
+            cont.push(ChatMessage::user(
+                "若还需要执行命令，可继续用 run 块发出（AION 会自动执行）；否则直接给出最终结论。",
+            ));
         }
     }
 
+    if new_history.len() > 40 {
+        let drop = new_history.len() - 40;
+        new_history.drain(..drop);
+    }
     state
         .sessions
         .lock()
@@ -335,34 +450,312 @@ fn summarize_tool_output(result_json: &serde_json::Value) -> String {
     }
 }
 
-/// 工具执行后，把输出回喂模型生成后续回答。
-async fn continue_after_tool(
-    ctx: &cordis::Context,
-    sec: &aion_services::SecurityContext,
-    history: &[ChatMessage],
-    tool_output: &str,
-) -> anyhow::Result<String> {
-    let model = ctx
-        .require::<aion_services::model::ModelService>()
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-    let mut msgs: Vec<ChatMessage> =
-        vec![ChatMessage::system(aion::agents::assistant::ASSISTANT_SYSTEM)];
-    msgs.extend_from_slice(history);
-    msgs.push(ChatMessage::user(format!(
-        "上面那条命令的真实执行输出如下：\n{tool_output}\n请基于真实输出继续回答，保持简洁。"
-    )));
-    Ok(model.chat(sec, None, &msgs).await?)
+/// 拆 `reply` 的产物：正文 + 一组 ```run 命令。
+struct RunParts {
+    prose: String,
+    cmds: Vec<String>,
 }
 
-/// 从 markdown reply 里提取 ```run\n command \n``` 代码块。
-fn extract_run_block(reply: &str) -> Option<String> {
-    let marker = "```run\n";
-    let start = reply.find(marker)?;
-    let rest = &reply[start + marker.len()..];
-    let end = rest.find("```")?;
-    let cmd = rest[..end].trim().to_string();
-    if cmd.is_empty() { None } else { Some(cmd) }
+/// 从 markdown reply 里提取所有 ```run\n <cmd> \n``` 代码块，其余并入正文。
+fn split_run_blocks(reply: &str) -> RunParts {
+    let marker = "```run";
+    let mut prose = String::new();
+    let mut cmds = Vec::new();
+    let mut rest = reply;
+    loop {
+        match rest.find(marker) {
+            None => {
+                prose.push_str(rest);
+                break;
+            }
+            Some(idx) => {
+                prose.push_str(&rest[..idx]);
+                let after = &rest[idx + marker.len()..];
+                // 吃掉 ```run 行尾（允许语言后缀），命令自下一行起
+                let after = match after.find('\n') {
+                    Some(nl) => &after[nl + 1..],
+                    None => "",
+                };
+                match after.find("```") {
+                    None => break,
+                    Some(end) => {
+                        let cmd = after[..end].trim().to_string();
+                        if !cmd.is_empty() {
+                            cmds.push(cmd);
+                        }
+                        let tail = &after[end + 3..];
+                        rest = tail.strip_prefix('\n').unwrap_or(tail);
+                    }
+                }
+            }
+        }
+    }
+    RunParts {
+        prose: prose.trim().to_string(),
+        cmds,
+    }
+}
+
+/// 流式 Chat：SSE 逐 token 输出；reply 中的 ```run 命令自动执行并把真实输出回喂，再流式续答。
+async fn api_chat_stream(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<ChatRequest>,
+) -> Response {
+    use tokio::sync::mpsc;
+    let (tx, rx) = mpsc::unbounded_channel::<String>();
+    let session_id = req
+        .session_id
+        .clone()
+        .unwrap_or_else(|| format!("web-{}", std::process::id()));
+    let _ = tx.send(
+        serde_json::json!({ "type": "start", "session_id": session_id }).to_string(),
+    );
+
+    let st = state.clone();
+    let input = req.message.clone();
+    let session_key = session_id.clone();
+    tokio::spawn(async move {
+        let emit = |v: serde_json::Value| {
+            let _ = tx.send(v.to_string());
+        };
+
+        let history: Vec<ChatMessage> = st
+            .sessions
+            .lock()
+            .await
+            .get(&session_key)
+            .cloned()
+            .unwrap_or_default();
+        let sec = aion::agents::developer_sec("web-user", &[]);
+
+        let model = match st.ctx.require::<ModelService>().await {
+            Ok(m) => m,
+            Err(e) => {
+                emit(serde_json::json!({
+                    "type": "error",
+                    "message": format!("model unavailable: {e}")
+                }));
+                return;
+            }
+        };
+
+        // 1) 首个回答：流式增量 → delta 事件（forwarder 把模型文本包成 JSON 事件）
+        let (dtx, drx) = mpsc::unbounded_channel::<String>();
+        let outer = tx.clone();
+        let fwd = tokio::spawn(async move {
+            let mut drx = drx;
+            while let Some(text) = drx.recv().await {
+                let _ = outer.send(
+                    serde_json::json!({ "type": "delta", "text": text }).to_string(),
+                );
+            }
+        });
+        let msgs = aion::agents::assistant::chat_messages(&history, &input);
+        let reply = match model.chat_stream(&sec, None, &msgs, dtx).await {
+            Ok(r) => r,
+            Err(e) => {
+                emit(serde_json::json!({
+                    "type": "error",
+                    "message": format!("LLM error: {e}")
+                }));
+                return;
+            }
+        };
+        // dtx 已在 chat_stream 内 drop；等增量转发排空后再封口首段
+        let _ = fwd.await;
+
+        let parts = split_run_blocks(&reply);
+        emit(serde_json::json!({ "type": "seal", "final": parts.prose }));
+
+        let mut new_history = history;
+        new_history.push(ChatMessage::user(input.clone()));
+        new_history.push(ChatMessage::assistant(parts.prose.clone()));
+
+        // 2) 逐个执行 ```run 命令，事件实时推给前端
+        for cmd in &parts.cmds {
+            emit(serde_json::json!({
+                "type": "tool",
+                "tool": "terminal.exec",
+                "command": cmd
+            }));
+            let tc = ToolCall {
+                call_id: CallId::new(),
+                tool: "terminal.exec".into(),
+                arguments: serde_json::json!({ "command": cmd }),
+                sandbox: Some(ToolSandboxHint::Default),
+            };
+            let result = st
+                .tool_runtime
+                .execute(&st.ctx, tc.clone(), sec.clone())
+                .await;
+            let result_json =
+                serde_json::to_value(&result).unwrap_or(serde_json::Value::Null);
+            let output_text = summarize_tool_output(&result_json);
+            let stdout = result_json
+                .get("stdout")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let stderr = result_json
+                .get("stderr")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let code = result_json
+                .get("exit_code")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(-1);
+            let timed_out = result_json
+                .get("timed_out")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            emit(serde_json::json!({
+                "type": "terminal",
+                "command": cmd,
+                "output": stdout,
+                "stderr": stderr,
+                "code": code,
+                "timed_out": timed_out,
+            }));
+            new_history.push(ChatMessage::user(format!(
+                "我发出的命令 `{cmd}` 已自动执行，输出：\n{output_text}"
+            )));
+        }
+
+        // 3) 有执行过命令 → 把真实输出回喂并进入有界 agentic 循环：
+        //    模型后续回复若仍含 ```run 命令则继续自动执行→续答，直到模型不再发命令或到达轮次上限。
+        if !parts.cmds.is_empty() {
+            let mut cont = vec![ChatMessage::system(
+                aion::agents::assistant::ASSISTANT_SYSTEM,
+            )];
+            for m in new_history.iter().rev().take(20).rev() {
+                cont.push(m.clone());
+            }
+            cont.push(ChatMessage::user(
+                "若还需要执行命令，可继续用 run 块发出（AION 会自动执行）；否则直接给出最终结论。",
+            ));
+            let mut rounds = 0usize;
+            loop {
+                rounds += 1;
+                if rounds > 6 {
+                    break;
+                }
+                let (dtx2, drx2) = mpsc::unbounded_channel::<String>();
+                let outer2 = tx.clone();
+                let fwd2 = tokio::spawn(async move {
+                    let mut drx2 = drx2;
+                    while let Some(text) = drx2.recv().await {
+                        let _ = outer2.send(
+                            serde_json::json!({ "type": "delta", "text": text }).to_string(),
+                        );
+                    }
+                });
+                let turn = match model.chat_stream(&sec, None, &cont, dtx2).await {
+                    Ok(t) => t,
+                    Err(e) => {
+                        emit(serde_json::json!({
+                            "type": "error",
+                            "message": format!("followup error: {e}")
+                        }));
+                        break;
+                    }
+                };
+                let _ = fwd2.await;
+
+                let parts2 = split_run_blocks(&turn);
+                if !parts2.prose.is_empty() {
+                    emit(serde_json::json!({
+                        "type": "seal",
+                        "final": parts2.prose
+                    }));
+                    new_history.push(ChatMessage::assistant(parts2.prose.clone()));
+                }
+                if parts2.cmds.is_empty() {
+                    break;
+                }
+                for cmd in &parts2.cmds {
+                    emit(serde_json::json!({
+                        "type": "tool",
+                        "tool": "terminal.exec",
+                        "command": cmd
+                    }));
+                    let tc = ToolCall {
+                        call_id: CallId::new(),
+                        tool: "terminal.exec".into(),
+                        arguments: serde_json::json!({ "command": cmd }),
+                        sandbox: Some(ToolSandboxHint::Default),
+                    };
+                    let result = st
+                        .tool_runtime
+                        .execute(&st.ctx, tc.clone(), sec.clone())
+                        .await;
+                    let result_json =
+                        serde_json::to_value(&result).unwrap_or(serde_json::Value::Null);
+                    let output_text = summarize_tool_output(&result_json);
+                    let stdout = result_json
+                        .get("stdout")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    let stderr = result_json
+                        .get("stderr")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    let code = result_json
+                        .get("exit_code")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(-1);
+                    let timed_out = result_json
+                        .get("timed_out")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    emit(serde_json::json!({
+                        "type": "terminal",
+                        "command": cmd,
+                        "output": stdout,
+                        "stderr": stderr,
+                        "code": code,
+                        "timed_out": timed_out,
+                    }));
+                    new_history.push(ChatMessage::user(format!(
+                        "我发出的命令 `{cmd}` 已自动执行，输出：\n{output_text}"
+                    )));
+                }
+                if new_history.len() > 40 {
+                    let drop = new_history.len() - 40;
+                    new_history.drain(..drop);
+                }
+                cont = vec![ChatMessage::system(
+                    aion::agents::assistant::ASSISTANT_SYSTEM,
+                )];
+                for m in new_history.iter().rev().take(20).rev() {
+                    cont.push(m.clone());
+                }
+                cont.push(ChatMessage::user(
+                    "若还需要执行命令，可继续用 run 块发出（AION 会自动执行）；否则直接给出最终结论。",
+                ));
+            }
+        }
+
+        if new_history.len() > 40 {
+            let drop = new_history.len() - 40;
+            new_history.drain(..drop);
+        }
+        st.sessions.lock().await.insert(session_key, new_history);
+        emit(serde_json::json!({ "type": "done", "session_id": session_id }));
+    });
+
+    let stream = fstream::unfold(rx, |rx| async move {
+        let mut rx = rx;
+        match rx.recv().await {
+            Some(payload) => Some((Ok::<_, Infallible>(Event::default().data(payload)), rx)),
+            None => None,
+        }
+    });
+    Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response()
 }
 
 // ---------------------------------------------------------------------------
