@@ -20,6 +20,7 @@ pub mod fs;
 pub mod model;
 pub mod network;
 pub mod process;
+pub mod provider;
 pub mod sandbox;
 pub mod security;
 pub mod storage;
@@ -30,6 +31,7 @@ pub mod tool;
 use aion_adapter::AdapterKit;
 
 pub use error::{AionError, AionResult};
+pub use provider::{backend_from_provider, LlmProtocol, LlmProvider, LlmProviderStore};
 pub use sandbox::SandboxRequest;
 pub use security::SecurityContext;
 pub use tool::{populate_builtin_registry, Tool, ToolCallScope, ToolRegistry, ToolRuntime};

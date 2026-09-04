@@ -65,6 +65,39 @@ cargo run -p aion -- services
 }
 ```
 
+## LLM 供应商管理（cc-switch 风格）
+
+Web UI 的 ⚙️ Settings → LLM 面板可以维护多组供应商配置（命名档位），一键启用切换，
+配置持久化在工作目录的 `aion.providers.json`（含 API Key，已在 `.gitignore` 中排除，
+**请勿提交到仓库**）。
+
+支持两种协议：
+
+| 协议 | 请求端点 | 示例 |
+|------|----------|------|
+| `openai` | `POST {base_url}/chat/completions` | DeepSeek / Qwen / OpenAI / 小米 MiMo |
+| `anthropic` | `POST {base_url}/v1/messages` | 智谱 GLM（`https://open.bigmodel.cn/api/anthropic`）/ Anthropic |
+
+`anthropic` 协议的 `base_url` 不需要带 `/v1` 后缀（自动补全）；思考模型返回的
+`thinking` 块会被自动跳过，仅取 `text` 块。切换/新增供应商既可在 UI 操作，也可调用 API：
+
+```bash
+# 新增并启用
+curl -X POST http://127.0.0.1:18080/api/llm/providers -H 'Content-Type: application/json' -d '{
+  "name": "智谱 GLM", "protocol": "anthropic",
+  "base_url": "https://open.bigmodel.cn/api/anthropic",
+  "api_key": "<YOUR_KEY>", "model": "glm-5.3-flash"
+}'
+
+# 列表 / 启用 / 测试 / 删除
+curl http://127.0.0.1:18080/api/llm/providers
+curl -X POST http://127.0.0.1:18080/api/llm/providers/<id>/activate
+curl -X POST http://127.0.0.1:18080/api/llm/test -H 'Content-Type: application/json' -d '{"id":"<id>"}'
+curl -X DELETE http://127.0.0.1:18080/api/llm/providers/<id>
+```
+
+服务重启时会自动恢复上一次启用的供应商档位。
+
 ## 工程结构
 
 ```

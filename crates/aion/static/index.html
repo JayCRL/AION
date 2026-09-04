@@ -120,6 +120,23 @@ body{font-family:'Inter',-apple-system,sans-serif;background:var(--bg);color:var
 .svc-row .n{font-family:monospace}
 .svc-row .st{font-size:11px;color:var(--ok)}
 .svc-row .st.pending{color:var(--txt2)}
+/* ── provider manager (cc-switch style) ── */
+.prov-row{border:1px solid var(--glass-brd);border-radius:10px;padding:12px 14px;margin-bottom:10px;transition:border-color .2s,background .2s}
+.prov-row.active{border-color:var(--acc);background:rgba(124,110,228,.08)}
+.prov-row .top{display:flex;align-items:center;gap:8px}
+.prov-row .dot{width:8px;height:8px;border-radius:50%;background:var(--glass-brd);flex:none}
+.prov-row.active .dot{background:var(--acc);box-shadow:0 0 8px var(--acc-glow)}
+.prov-row .nm{font-size:14px;font-weight:600}
+.prov-row .badge{font-size:10px;padding:2px 7px;border-radius:4px;background:var(--bg3);color:var(--txt2);font-family:monospace}
+.prov-row.active .badge{background:rgba(124,110,228,.2);color:var(--acc)}
+.prov-row .meta{font-size:11px;color:var(--txt2);margin-top:5px;word-break:break-all}
+.prov-row .ops{display:flex;gap:6px;margin-top:10px}
+.mini-btn{padding:4px 12px;border-radius:6px;border:1px solid var(--glass-brd);background:var(--bg3);color:var(--txt2);font-size:11px;cursor:pointer;transition:all .2s}
+.mini-btn:hover{border-color:var(--acc);color:var(--txt)}
+.mini-btn.primary{background:var(--acc);border-color:var(--acc);color:#fff}
+.mini-btn.danger:hover{border-color:var(--err);color:var(--err)}
+.model-chip{position:fixed;bottom:26px;left:72px;z-index:20;font-size:11px;color:var(--txt2);display:flex;align-items:center;gap:6px}
+.model-chip .live{width:6px;height:6px;border-radius:50%;background:var(--ok);box-shadow:0 0 6px var(--ok)}
 
 /* ── toast ── */
 .toast{position:fixed;bottom:20px;right:20px;background:var(--bg3);border:1px solid var(--glass-brd);color:var(--txt);padding:10px 18px;border-radius:var(--r);font-size:13px;z-index:200;animation:slideUp .3s}
@@ -157,6 +174,7 @@ body{font-family:'Inter',-apple-system,sans-serif;background:var(--bg);color:var
 
 <!-- gear -->
 <div class="gear-btn" onclick="openSettings()" title="Settings">⚙️</div>
+<div class="model-chip" id="modelChip" style="display:none"><span class="live"></span><span id="modelName"></span></div>
 
 <!-- settings modal -->
 <div class="modal-ov" id="settingsModal">
@@ -168,16 +186,29 @@ body{font-family:'Inter',-apple-system,sans-serif;background:var(--bg);color:var
       <div class="tab" onclick="switchTab('services',this)">Services</div>
     </div>
     <div class="tab-content active" id="tab-llm">
-      <div class="fg"><label>Provider</label><select id="cfgProvider" onchange="onProviderChange()">
-        <option value="deepseek">DeepSeek</option>
-        <option value="openai">OpenAI</option>
-        <option value="qwen">Qwen (DashScope)</option>
-        <option value="custom">Custom</option>
-      </select></div>
-      <div class="fg"><label>API Key</label><input type="password" id="cfgKey" placeholder="sk-..."></div>
-      <div class="fg"><label>Base URL</label><input type="text" id="cfgUrl" placeholder="https://api.deepseek.com/v1"></div>
-      <div class="fg"><label>Model</label><input type="text" id="cfgModel" placeholder="deepseek-chat"></div>
-      <button class="save-btn" onclick="saveConfig()">Save & Apply</button>
+      <div id="provList"><p style="color:var(--txt2);font-size:13px">Loading...</p></div>
+      <div id="provForm" style="display:none;margin-top:6px;border-top:1px solid var(--glass-brd);padding-top:14px">
+        <div class="fg"><label>名称</label><input type="text" id="pName" placeholder="例：智谱 GLM / DeepSeek"></div>
+        <div class="fg"><label>协议</label><select id="pProtocol">
+          <option value="openai">OpenAI 兼容（{base}/chat/completions）</option>
+          <option value="anthropic">Anthropic 兼容（{base}/v1/messages）</option>
+        </select></div>
+        <div class="fg"><label>预设填充</label><select id="pPreset" onchange="onPresetChange()">
+          <option value="">— 选择预设 —</option>
+          <option value="zhipu">智谱 GLM（Anthropic）</option>
+          <option value="deepseek">DeepSeek</option>
+          <option value="openai">OpenAI</option>
+          <option value="qwen">Qwen (DashScope)</option>
+        </select></div>
+        <div class="fg"><label>Base URL</label><input type="text" id="pUrl" placeholder="https://api.deepseek.com/v1"></div>
+        <div class="fg"><label>API Key</label><input type="password" id="pKey" placeholder="sk-...（编辑时留空 = 不修改）"></div>
+        <div class="fg"><label>Model</label><input type="text" id="pModel" placeholder="deepseek-chat"></div>
+        <div style="display:flex;gap:8px;margin-top:8px">
+          <button class="save-btn" style="margin-top:0" onclick="saveProvider()">保存并启用</button>
+          <button class="save-btn" style="margin-top:0;background:var(--bg3);color:var(--txt2)" onclick="hideProvForm()">取消</button>
+        </div>
+      </div>
+      <button class="save-btn" id="addProvBtn" style="background:var(--bg3);color:var(--txt)" onclick="showProvForm()">＋ 添加供应商</button>
     </div>
     <div class="tab-content" id="tab-tools">
       <div id="toolsList">Loading...</div>
@@ -193,7 +224,13 @@ let $=function(s){return document.querySelector(s)};
 let chatArea=document.getElementById('chatArea');
 let input=document.getElementById('msgInput');
 let inChatMode=false;
-let PRESETS={deepseek:{url:'https://api.deepseek.com/v1',model:'deepseek-chat'},openai:{url:'https://api.openai.com/v1',model:'gpt-4o'},qwen:{url:'https://dashscope.aliyuncs.com/compatible-mode/v1',model:'qwen-turbo'},custom:{url:'',model:''}};
+let PROV_PRESETS={
+  zhipu:{protocol:'anthropic',url:'https://open.bigmodel.cn/api/anthropic',model:'glm-5.3-flash'},
+  deepseek:{protocol:'openai',url:'https://api.deepseek.com/v1',model:'deepseek-chat'},
+  openai:{protocol:'openai',url:'https://api.openai.com/v1',model:'gpt-4o'},
+  qwen:{protocol:'openai',url:'https://dashscope.aliyuncs.com/compatible-mode/v1',model:'qwen-turbo'}
+};
+let editProvId=null;
 
 // init
 async function init(){
@@ -201,9 +238,160 @@ async function init(){
     let[h,t]=await Promise.all([fetch('/api/health').then(r=>r.json()),fetch('/api/tools').then(r=>r.json())]);
     renderTools(t.tools||[]);
     renderServices(h.services||[]);
+    updateModelChip(h.llm);
   }catch(e){console.error(e)}
+  loadProviders();
   input.addEventListener('keydown',function(e){if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();send()}});
   input.focus();
+}
+
+// ── LLM provider manager（cc-switch 风格）──
+async function loadProviders(){
+  try{
+    let d=await fetch('/api/llm/providers').then(function(r){return r.json()});
+    renderProviders(d.providers||[],d.active);
+  }catch(e){
+    document.getElementById('provList').innerHTML='<p style="color:var(--err);font-size:13px">加载失败: '+esc(e.message)+'</p>';
+  }
+}
+
+function renderProviders(providers,activeId){
+  let el=document.getElementById('provList');
+  if(!providers.length){
+    el.innerHTML='<p style="color:var(--txt2);font-size:13px;margin-bottom:10px">尚未配置供应商，当前使用内置 Echo 后端。点击下方「添加供应商」接入真实 LLM。</p>';
+    return;
+  }
+  el.innerHTML='';
+  providers.forEach(function(p){
+    let row=document.createElement('div');
+    row.className='prov-row'+(p.active?' active':'');
+    let meta=esc(p.model)+' · '+esc(p.base_url)+(p.has_key?'':' · <span style="color:var(--warn)">未设置 Key</span>');
+    row.innerHTML='<div class="top"><span class="dot"></span><span class="nm">'+esc(p.name)+'</span><span class="badge">'+esc(p.protocol)+'</span></div>'
+      +'<div class="meta">'+meta+'</div>'
+      +'<div class="ops">'
+      +(p.active?'':'<button class="mini-btn primary" onclick="activateProvider(\''+esc(p.id)+'\')">启用</button>')
+      +'<button class="mini-btn" onclick="testProvider(\''+esc(p.id)+'\')">测试</button>'
+      +'<button class="mini-btn" onclick="editProvider(\''+esc(p.id)+'\')">编辑</button>'
+      +'<button class="mini-btn danger" onclick="deleteProvider(\''+esc(p.id)+'\')">删除</button>'
+      +(p.active?'<span style="margin-left:auto;font-size:11px;color:var(--acc);align-self:center">✓ 当前使用</span>':'')
+      +'</div>';
+    el.appendChild(row);
+  });
+}
+
+function updateModelChip(llm){
+  let chip=document.getElementById('modelChip');
+  if(llm&&llm.name){
+    chip.style.display='flex';
+    document.getElementById('modelName').textContent=llm.name+' · '+llm.model;
+  }else{
+    chip.style.display='none';
+  }
+}
+
+function showProvForm(){
+  editProvId=null;
+  document.getElementById('provForm').style.display='block';
+  document.getElementById('addProvBtn').style.display='none';
+  ['pName','pUrl','pKey','pModel'].forEach(function(id){document.getElementById(id).value=''});
+  document.getElementById('pProtocol').value='openai';
+  document.getElementById('pPreset').value='';
+  document.getElementById('pName').focus();
+}
+function hideProvForm(){
+  document.getElementById('provForm').style.display='none';
+  document.getElementById('addProvBtn').style.display='block';
+  editProvId=null;
+}
+function onPresetChange(){
+  let key=document.getElementById('pPreset').value;
+  let p=PROV_PRESETS[key];
+  if(!p)return;
+  document.getElementById('pProtocol').value=p.protocol;
+  document.getElementById('pUrl').value=p.url;
+  document.getElementById('pModel').value=p.model;
+}
+
+async function saveProvider(){
+  let body={
+    name:document.getElementById('pName').value.trim(),
+    protocol:document.getElementById('pProtocol').value,
+    base_url:document.getElementById('pUrl').value.trim(),
+    api_key:document.getElementById('pKey').value,
+    model:document.getElementById('pModel').value.trim(),
+    activate:true
+  };
+  if(editProvId)body.id=editProvId;
+  if(!body.name){showToast('请填写供应商名称','error');return}
+  if(!body.base_url||!body.model){showToast('Base URL 与 Model 不能为空','error');return}
+  if(!editProvId&&!body.api_key){showToast('请填写 API Key','error');return}
+  try{
+    let r=await fetch('/api/llm/providers',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    let d=await r.json();
+    if(d.status==='ok'){
+      showToast('✅ '+body.name+' 已启用');
+      hideProvForm();
+      await loadProviders();
+      refreshHealth();
+    }else{showToast('保存失败: '+(d.error||'未知错误'),'error')}
+  }catch(e){showToast('保存失败: '+e.message,'error')}
+}
+
+function editProvider(id){
+  let d=allProvidersCache.find(function(p){return p.id===id});
+  if(!d)return;
+  editProvId=id;
+  document.getElementById('provForm').style.display='block';
+  document.getElementById('addProvBtn').style.display='none';
+  document.getElementById('pName').value=d.name;
+  document.getElementById('pProtocol').value=d.protocol;
+  document.getElementById('pUrl').value=d.base_url;
+  document.getElementById('pKey').value='';
+  document.getElementById('pKey').placeholder=d.has_key?'已设置（留空 = 不修改）':'sk-...';
+  document.getElementById('pModel').value=d.model;
+  document.getElementById('pPreset').value='';
+}
+
+async function activateProvider(id){
+  try{
+    let r=await fetch('/api/llm/providers/'+id+'/activate',{method:'POST'});
+    let d=await r.json();
+    if(d.status==='ok'){showToast('✅ 已切换');await loadProviders();refreshHealth()}
+    else showToast('切换失败: '+(d.error||''),'error');
+  }catch(e){showToast('切换失败: '+e.message,'error')}
+}
+
+async function deleteProvider(id){
+  if(!confirm('确定删除该供应商配置？'))return;
+  try{
+    let r=await fetch('/api/llm/providers/'+id,{method:'DELETE'});
+    let d=await r.json();
+    if(d.status==='ok'){showToast('已删除');await loadProviders();refreshHealth()}
+    else showToast('删除失败: '+(d.error||''),'error');
+  }catch(e){showToast('删除失败: '+e.message,'error')}
+}
+
+async function testProvider(id){
+  showToast('测试中...');
+  try{
+    let r=await fetch('/api/llm/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:id})});
+    let d=await r.json();
+    if(d.status==='ok')showToast('✅ 连通正常: '+String(d.reply).substring(0,40));
+    else showToast('❌ '+(d.error||'测试失败').substring(0,120),'error');
+  }catch(e){showToast('❌ '+e.message,'error')}
+}
+
+let allProvidersCache=[];
+function cacheProviders(list){allProvidersCache=list}
+let _origRender=renderProviders;
+renderProviders=function(list,activeId){allProvidersCache=list;_origRender(list,activeId)};
+
+async function refreshHealth(){
+  try{
+    let h=await fetch('/api/health').then(function(r){return r.json()});
+    updateModelChip(h.llm);
+    renderServices(h.services||[]);
+  }catch(e){}
 }
 
 function renderTools(tools){
@@ -332,6 +520,7 @@ async function confirmAction(rid,choice){
 function openSettings(){
   document.getElementById('settingsModal').classList.add('open');
   refreshToolsAndServices();
+  loadProviders();
 }
 function closeSettings(){document.getElementById('settingsModal').classList.remove('open')}
 function switchTab(name,el){
@@ -339,20 +528,6 @@ function switchTab(name,el){
   el.classList.add('active');
   document.querySelectorAll('.tab-content').forEach(function(t){t.classList.remove('active')});
   document.getElementById('tab-'+name).classList.add('active');
-}
-function onProviderChange(){
-  let p=PRESETS[this.value];
-  if(p){document.getElementById('cfgUrl').value=p.url;document.getElementById('cfgModel').value=p.model}
-}
-
-async function saveConfig(){
-  let cfg={provider:document.getElementById('cfgProvider').value,api_key:document.getElementById('cfgKey').value,api_url:document.getElementById('cfgUrl').value,model:document.getElementById('cfgModel').value};
-  if(!cfg.api_key){showToast('Please enter API Key','error');return}
-  try{
-    let r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(cfg)});
-    let d=await r.json();
-    showToast(d.status==='ok'?'✅ '+d.model+' ready':'Save failed');
-  }catch(e){showToast('Save failed: '+e.message,'error')}
 }
 
 async function refreshToolsAndServices(){

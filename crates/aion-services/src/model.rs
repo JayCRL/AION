@@ -119,6 +119,7 @@ impl ModelBackend for OpenAiCompatBackend {
     }
 
     async fn chat(&self, messages: &[ChatMessage]) -> AionResult<String> {
+        ensure_http_scheme(&self.base_url)?;
         let url = format!("{}/chat/completions", self.base_url);
         let msgs: Vec<serde_json::Value> = messages
             .iter()
@@ -169,6 +170,193 @@ impl ModelBackend for OpenAiCompatBackend {
                     &text[..text.len().min(200)]
                 ))
             })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Anthropic 兼容后端（Messages API：POST {base_url}/v1/messages）
+// ---------------------------------------------------------------------------
+
+/// 规范化 Anthropic base_url：去尾斜杠与多余的 `/v1`（实际请求拼 `{base}/v1/messages`）。
+pub fn normalize_anthropic_base(base_url: &str) -> String {
+    let s = base_url.trim().trim_end_matches('/');
+    let s = s.strip_suffix("/v1").unwrap_or(s);
+    s.to_string()
+}
+
+/// 校验 base_url 至少带 http(s) 前缀，避免 reqwest 报出难懂的 builder error。
+fn ensure_http_scheme(base_url: &str) -> AionResult<()> {
+    if base_url.starts_with("http://") || base_url.starts_with("https://") {
+        Ok(())
+    } else {
+        Err(AionError::Model(format!(
+            "invalid base_url `{base_url}`: must start with http:// or https://"
+        )))
+    }
+}
+
+/// 合并连续同角色消息（Anthropic Messages API 要求 user/assistant 交替，且首条为 user）。
+fn merge_anthropic_messages(msgs: Vec<(String, String)>) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for (role, content) in msgs {
+        if let Some(last) = out.last_mut() {
+            if last.0 == role {
+                if !content.is_empty() {
+                    if !last.1.is_empty() {
+                        last.1.push_str("\n\n");
+                    }
+                    last.1.push_str(&content);
+                }
+                continue;
+            }
+        }
+        out.push((role, content));
+    }
+    if out.first().map(|m| m.0.as_str()) != Some("user") {
+        out.insert(0, ("user".into(), "(继续)".into()));
+    }
+    out
+}
+
+/// Anthropic Messages API 后端。
+///
+/// 任何兼容 `POST {base_url}/v1/messages` 协议的 LLM 服务都可以接入：
+/// - 智谱 GLM: `https://open.bigmodel.cn/api/anthropic` + `glm-5.3-flash`
+/// - Anthropic: `https://api.anthropic.com` + `claude-sonnet-5`
+///
+/// 注意：`base_url` 不需要（也不应该）带 `/v1` 后缀，会自动补全。
+/// 思考模型（如 GLM-5.3-Flash）返回的 `thinking` 块会被跳过，仅取 `text` 块。
+pub struct AnthropicCompatBackend {
+    name: String,
+    base_url: String,
+    model: String,
+    api_key: String,
+    max_tokens: u32,
+    client: reqwest::Client,
+}
+
+impl AnthropicCompatBackend {
+    pub fn new(
+        name: impl Into<String>,
+        base_url: impl Into<String>,
+        model: impl Into<String>,
+        api_key: impl Into<String>,
+    ) -> Self {
+        Self::with_max_tokens(name, base_url, model, api_key, 8192)
+    }
+
+    pub fn with_max_tokens(
+        name: impl Into<String>,
+        base_url: impl Into<String>,
+        model: impl Into<String>,
+        api_key: impl Into<String>,
+        max_tokens: u32,
+    ) -> Self {
+        AnthropicCompatBackend {
+            name: name.into(),
+            base_url: normalize_anthropic_base(&base_url.into()),
+            model: model.into(),
+            api_key: api_key.into(),
+            max_tokens,
+            client: reqwest::Client::new(),
+        }
+    }
+
+    fn endpoint(&self) -> String {
+        format!("{}/v1/messages", self.base_url)
+    }
+}
+
+#[async_trait]
+impl ModelBackend for AnthropicCompatBackend {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    async fn chat(&self, messages: &[ChatMessage]) -> AionResult<String> {
+        ensure_http_scheme(&self.base_url)?;
+        let mut system_parts: Vec<String> = Vec::new();
+        let mut pairs: Vec<(String, String)> = Vec::new();
+        for m in messages {
+            match m.role.as_str() {
+                "system" => system_parts.push(m.content.clone()),
+                "user" => pairs.push(("user".into(), m.content.clone())),
+                _ => pairs.push(("assistant".into(), m.content.clone())),
+            }
+        }
+        let msgs: Vec<serde_json::Value> = merge_anthropic_messages(pairs)
+            .into_iter()
+            .map(|(role, content)| serde_json::json!({"role": role, "content": content}))
+            .collect();
+
+        let mut body = serde_json::json!({
+            "model": self.model,
+            "max_tokens": self.max_tokens,
+            "messages": msgs,
+        });
+        if !system_parts.is_empty() {
+            body["system"] = serde_json::Value::String(system_parts.join("\n\n"));
+        }
+
+        let resp = self
+            .client
+            .post(self.endpoint())
+            .header("x-api-key", &self.api_key)
+            .header("anthropic-version", "2023-06-01")
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .timeout(std::time::Duration::from_secs(120))
+            .send()
+            .await
+            .map_err(|e| AionError::Model(format!("LLM request failed: {e}")))?;
+
+        let status = resp.status();
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| AionError::Model(format!("LLM response read failed: {e}")))?;
+
+        if !status.is_success() {
+            return Err(AionError::Model(format!(
+                "LLM API returned {status}: {text}"
+            )));
+        }
+
+        let data: serde_json::Value = serde_json::from_str(&text)
+            .map_err(|e| AionError::Model(format!("LLM response parse failed: {e}")))?;
+
+        // content 可能是块数组（当前协议）或纯字符串（旧协议），都兼容。
+        let reply: Option<String> = match data.get("content") {
+            Some(serde_json::Value::String(s)) => Some(s.clone()),
+            Some(serde_json::Value::Array(blocks)) => {
+                let parts: Vec<&str> = blocks
+                    .iter()
+                    .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
+                    .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                    .collect();
+                if parts.is_empty() {
+                    None
+                } else {
+                    Some(parts.join("\n"))
+                }
+            }
+            _ => None,
+        };
+
+        match reply {
+            Some(s) if !s.trim().is_empty() => Ok(s),
+            _ => {
+                let stop = data
+                    .get("stop_reason")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("unknown");
+                Err(AionError::Model(format!(
+                    "LLM returned no text content (stop_reason={stop}; \
+                     思考模型可能耗尽了 max_tokens，可调大): {}",
+                    &text[..text.len().min(200)]
+                )))
+            }
+        }
     }
 }
 
@@ -275,5 +463,54 @@ impl cordis::Service for ModelService {
         }
         ctx.info("ModelService ready (backends: echo)");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_normalize_anthropic_base() {
+        assert_eq!(
+            normalize_anthropic_base("https://open.bigmodel.cn/api/anthropic"),
+            "https://open.bigmodel.cn/api/anthropic"
+        );
+        assert_eq!(
+            normalize_anthropic_base("https://open.bigmodel.cn/api/anthropic/"),
+            "https://open.bigmodel.cn/api/anthropic"
+        );
+        // 用户误带 /v1 后缀也能正确补全
+        assert_eq!(
+            normalize_anthropic_base("https://api.anthropic.com/v1/"),
+            "https://api.anthropic.com"
+        );
+    }
+
+    #[test]
+    fn test_merge_anthropic_messages() {
+        // 连续同角色合并（system 在调用前已被抽出，不会进入本函数）
+        let merged = merge_anthropic_messages(vec![
+            ("user".into(), "hi".into()),
+            ("assistant".into(), "hello".into()),
+            ("assistant".into(), "again".into()),
+        ]);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0], ("user".into(), "hi".into()));
+        assert_eq!(merged[1], ("assistant".into(), "hello\n\nagain".into()));
+    }
+
+    #[test]
+    fn test_merge_first_must_be_user() {
+        let merged = merge_anthropic_messages(vec![("assistant".into(), "hello".into())]);
+        assert_eq!(merged[0].0, "user");
+        assert_eq!(merged.len(), 2);
+    }
+
+    #[test]
+    fn test_ensure_http_scheme() {
+        assert!(ensure_http_scheme("https://example.com").is_ok());
+        assert!(ensure_http_scheme("http://127.0.0.1:8000").is_ok());
+        assert!(ensure_http_scheme("api.example.com/v1").is_err());
     }
 }
