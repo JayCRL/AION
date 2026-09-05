@@ -116,12 +116,14 @@ fn resolve_media_url(raw: &str) -> Option<String> {
 
     for _ in 0..MAX_TRIES {
         let Ok(mut child) = std::process::Command::new("yt-dlp")
-            .args([
+            // 纯视频流 bv[height<=720]：kiosk 无音频设备——带音轨的流会让 mpv 因初始化音频失败而
+        // 直接中止(Errors when loading file)，纯视频流无音轨、不初始化音频，静音照放。
+        .args([
                 "-g",
                 "--no-warnings",
                 "--no-playlist",
                 "--format",
-                "best[height<=720]/best",
+                "bv[height<=720]/best",
                 raw,
             ])
             .stdout(Stdio::piped())
