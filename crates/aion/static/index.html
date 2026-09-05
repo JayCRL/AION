@@ -108,6 +108,41 @@ body.lite .input-box{background:rgba(255,255,255,.09);border-color:rgba(255,255,
 .btn-d{background:var(--err);color:#fff}
 .btn-g{background:var(--bg3);color:var(--txt2);border:1px solid var(--glass-brd)}
 
+/* ── rich blocks: chart / image / file / markdown / stats ── */
+.blk-cap{font-size:11px;color:var(--txt2);margin:4px 2px 10px}
+.blk-chart{background:var(--bg2);border:1px solid var(--glass-brd);border-radius:12px;padding:14px 16px;margin:8px 0}
+.blk-chart .ct{font-size:14px;font-weight:600;margin-bottom:4px}
+.blk-chart .cl{font-size:11px;color:var(--txt2);margin:0 0 10px;display:flex;gap:14px;flex-wrap:wrap}
+.blk-chart .cl span{display:inline-flex;align-items:center;gap:6px}
+.blk-chart .cl i{width:9px;height:9px;border-radius:2px;display:inline-block}
+.blk-chart svg{width:100%;height:auto;display:block}
+.blk-chart .gl{stroke:rgba(255,255,255,.06)}
+.blk-chart .ax{fill:var(--txt2);font-size:10px}
+.blk-img{margin:8px 0}
+.blk-img img{max-width:100%;max-height:420px;object-fit:contain;border-radius:12px;border:1px solid var(--glass-brd);display:block;background:#000}
+.blk-img .cap{font-size:11px;color:var(--txt2);margin-top:6px;text-align:center}
+.blk-file{display:flex;align-items:center;gap:12px;background:var(--bg2);border:1px solid var(--glass-brd);border-radius:12px;padding:12px 16px;margin:8px 0}
+.blk-file .ico{font-size:22px;flex:none}
+.blk-file .mid{flex:1;min-width:0}
+.blk-file .path{font-family:monospace;font-size:13px;color:var(--txt);word-break:break-all}
+.blk-file .meta{font-size:11px;color:var(--txt2);margin-top:3px;display:flex;gap:10px;flex-wrap:wrap}
+.blk-file .badge{font-size:10px;padding:2px 8px;border-radius:5px;background:rgba(124,110,228,.16);color:var(--acc);font-family:monospace;flex:none}
+.blk-md{background:var(--bg2);border:1px solid var(--glass-brd);border-radius:12px;padding:16px 20px;margin:8px 0;font-size:14px;line-height:1.8;word-break:break-word}
+.blk-md h1,.blk-md h2,.blk-md h3,.blk-md h4{color:#fff;margin:12px 0 6px;line-height:1.35}
+.blk-md h1{font-size:20px}.blk-md h2{font-size:17px}.blk-md h3{font-size:15px}.blk-md h4{font-size:14px}
+.blk-md ul,.blk-md ol{padding-left:22px;margin:6px 0}
+.blk-md li{margin:3px 0}
+.blk-md a{color:var(--acc)}
+.blk-md img{max-width:100%;max-height:360px;object-fit:contain;border-radius:10px;margin:8px 0;background:#000}
+.blk-md blockquote{border-left:3px solid var(--acc);padding:2px 0 2px 12px;color:var(--txt2);margin:8px 0}
+.blk-md hr{border:none;border-top:1px solid var(--glass-brd);margin:12px 0}
+.blk-md code{font-family:monospace;font-size:12.5px;background:rgba(255,255,255,.05);padding:1px 5px;border-radius:4px}
+.blk-md pre{margin:8px 0}
+.blk-md pre code{display:block;background:#0a0a0a;padding:10px 12px;border-radius:8px;overflow-x:auto;font-size:12.5px;line-height:1.6}
+.stat .bar{height:3px;background:rgba(255,255,255,.08);border-radius:2px;margin-top:7px;overflow:hidden}
+.stat .bar i{display:block;height:100%;background:linear-gradient(90deg,var(--acc),var(--ok));border-radius:2px}
+.stat.cpu-hi .stat-v{color:var(--warn)}
+
 /* ── gear ── */
 .gear-btn{position:fixed;bottom:24px;left:24px;z-index:20;width:36px;height:36px;border-radius:50%;background:var(--glass);border:1px solid var(--glass-brd);cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:16px;transition:all .3s;backdrop-filter:blur(10px)}
 .gear-btn:hover{border-color:var(--acc);transform:rotate(90deg)}
@@ -553,6 +588,7 @@ function onSSE(ev){
       appendChip('🔧 '+(ev.tool||'tool')+(ev.command?' → $ '+ev.command:''));
       break;
     case'terminal':case'confirmation':case'table':case'file':case'image':
+    case'chart':case'markdown':case'stats':case'process':case'rich':
       removeTyping();openBubble=null;openAcc='';
       appendBlock(ev);
       break;
@@ -630,22 +666,50 @@ function renderBlock(b){
     }
     case'table':return renderTable(b);
     case'confirmation':return renderConfirm(b);
+    case'markdown':return'<div class="blk-md">'+md(b.source||b.markdown||'')+'</div>';
+    case'rich':return'<div class="blk-md">'+md(b.markdown||'')+'</div>';
+    case'image':return renderImage(b);
+    case'file':return renderFile(b);
+    case'chart':return renderChart(b);
+    case'stats':return renderStats(b);
+    case'process':return renderProcess(b);
     default:return'';
   }
 }
 
 function renderStats(b){
   let s=b.data||b,html='<div class="blk-stats">';
-  if(s.cpu)html+='<div class="stat"><div class="stat-v">CPU</div><div class="stat-l">'+(s.cpu.user||0)+' ticks</div></div>';
-  if(s.memory)html+='<div class="stat"><div class="stat-v">'+fmtGB(s.memory.total_bytes)+'</div><div class="stat-l">Memory</div></div>';
-  if(s.load)html+='<div class="stat"><div class="stat-v">'+(s.load.load1||'-')+'</div><div class="stat-l">Load 1m</div></div>';
-  if(s.uptime_seconds)html+='<div class="stat"><div class="stat-v">'+fmtUp(s.uptime_seconds)+'</div><div class="stat-l">Uptime</div></div>';
+  // CPU：换算 busy 比例（user+system+nice vs total，越忙越偏暖色）
+  if(s.cpu){
+    let u=+s.cpu.user||0,n=+s.cpu.nice||0,sy=+s.cpu.system||0,id=+s.cpu.idle||0,iw=+s.cpu.iowait||0;
+    let tot=u+n+sy+id+iw,busy=tot-id;
+    let pct=tot?Math.round(busy/tot*100):0;
+    let cls=pct>80?' stat cpu-hi':'';
+    html+='<div class="stat'+cls+'"><div class="stat-v">'+pct+'%</div><div class="stat-l">CPU busy</div>'
+      +'<div class="bar"><i style="width:'+Math.min(100,pct)+'%"></i></div></div>';
+  }
+  // Memory：已用 / 总量 + 占用条
+  if(s.memory){
+    let total=+s.memory.total_bytes||0,used=total-(+s.memory.available_bytes||total);
+    let pct=total?Math.round(used/total*100):0;
+    html+='<div class="stat"><div class="stat-v">'+fmtGB(used)+'</div><div class="stat-l">内存 '+pct+'% · '+fmtGB(total)+'</div>'
+      +'<div class="bar"><i style="width:'+Math.min(100,pct)+'%"></i></div></div>';
+  }
+  // Load
+  if(s.load){
+    let a=s.load.load1,b5=s.load.load5,c=s.load.load15;
+    html+='<div class="stat"><div class="stat-v">'+(fmt1(a))+'</div><div class="stat-l">Load 1m / '+fmt1(b5)+' / '+fmt1(c)+'</div></div>';
+  }
+  // Uptime
+  if(s.uptime_seconds)html+='<div class="stat"><div class="stat-v">'+fmtUp(s.uptime_seconds)+'</div><div class="stat-l">运行时长</div></div>';
   return html+'</div>';
 }
+function fmt1(v){if(v===undefined||v===null||isNaN(v))return'-';return String(Math.round(v*100)/100)}
 
 function renderTable(b){
   let h=b.headers||[],r=b.rows||[];
-  let html='<table class="blk-tbl"><tr>';
+  let html=(b.caption?'<div class="blk-cap">'+esc(b.caption)+'</div>':'');
+  html+='<table class="blk-tbl"><tr>';
   h.forEach(function(x){html+='<th>'+esc(x)+'</th>'});
   html+='</tr>';
   r.forEach(function(row){html+='<tr>';row.forEach(function(c){html+='<td>'+esc(String(c))+'</td>'});html+='</tr>'});
@@ -662,6 +726,194 @@ function renderConfirm(b){
     html+='<button class="btn '+(map[o.style]||'btn-g')+'" data-rid="'+esc(b.request_id)+'" data-choice="'+esc(o.choice)+'" onclick="confirmAction(this)">'+esc(o.label)+'</button>';
   });
   return html+'</div></div>';
+}
+
+// ── image 块：AION 原生展示网页/接口抓来的图片 ──
+function renderImage(b){
+  let src=b.src||'';
+  if(!src)return'';
+  let dim=(b.width||b.height)?' style="max-width:'+Number(b.width||720)+'px"' :'';
+  let html='<div class="blk-img"><img src="'+escA(src)+'" alt="'+escA(b.alt||'')+'" loading="lazy" onerror="imgErr(this)">';
+  if(b.alt)html+='<div class="cap">'+esc(b.alt)+'</div>';
+  return html+'</div>';
+}
+// 图片加载失败兜底：隐藏坏图，标注来源不可达
+function imgErr(el){
+  let alt=el.getAttribute('alt')||el.getAttribute('src')||'';
+  let cap=el.parentNode.querySelector('.cap');
+  el.remove();
+  if(cap)cap.textContent='⚠️ 图片不可达：'+alt;
+}
+
+// ── file 块：文件展示（路径/类型/大小/徽标） ──
+function renderFile(b){
+  let path=b.path||b.name||'';
+  let kind=b.kind||'';
+  let badge={source:'源文件',generated:'生成',downloadable:'⬇ 可下载'}[kind]||kind;
+  let size=b.size?fmtBytes(b.size):'';
+  let mime=b.mime||'';
+  let ico=fileIcon(mime,path);
+  let meta=[mime,size].filter(Boolean).join(' · ');
+  let html='<div class="blk-file"><span class="ico">'+ico+'</span>'
+    +'<div class="mid"><div class="path">'+esc(path)+'</div>'
+    +(meta?'<div class="meta">'+esc(meta)+'</div>':'')
+    +'</div>'+(badge?'<span class="badge">'+esc(badge)+'</span>':'')+'</div>';
+  return html;
+}
+function fileIcon(mime,path){
+  if(mime&&mime.indexOf('image/')===0)return'🖼️';
+  if(mime&&mime.indexOf('pdf')>=0)return'📕';
+  if(mime&&mime.indexOf('text/')===0)return'📄';
+  if(mime&&(mime.indexOf('json')>=0||mime.indexOf('javascript')>=0))return'{}';
+  let m=(mime||'').toLowerCase();
+  if(m.indexOf('html')>=0)return'🌐';
+  if(path&&/\.(jpg|jpeg|png|gif|webp|bmp)$/i.test(path))return'🖼️';
+  if(path&&/\.(mp3|wav|flac)$/i.test(path))return'🎵';
+  if(path&&/\.(mp4|mkv|webm)$/i.test(path))return'🎬';
+  return'📦';
+}
+function fmtBytes(n){
+  if(!n&&n!==0)return'';
+  let u=['B','KB','MB','GB','TB'],i=0;n=Number(n)||0;
+  while(n>=1024&&i<u.length-1){n/=1024;i++}
+  return(n.toFixed(n>=100?0:n>=10?1:2))+' '+u[i];
+}
+
+// ── chart 块：折线 / 柱状 / 散点（SVG） ──
+var CHART_COLORS=['#7c6ee4','#34d399','#60a5fa','#fbbf24','#f472b6','#22d3ee','#fb923c','#a78bfa'];
+function renderChart(b){
+  let kind=b.kind||'line';
+  let title=b.title||'';
+  let header='<div class="ct">'+esc(title)+'</div>';
+  let body='';
+  if(kind==='bar')body=chartBars(b);
+  else if(kind==='points')body=chartScatter(b);
+  else body=chartLines(b);
+  if(!body)return'<div class="blk-chart">'+header+'<div style="color:var(--txt2);font-size:12px;padding:6px 2px">(暂无数据)</div></div>';
+  return'<div class="blk-chart">'+header+body+'</div>';
+}
+function chartLegend(series){
+  if(!series||!series.length)return'';
+  return'<div class="cl">'+series.map(function(s,i){
+    return'<span><i style="background:'+CHART_COLORS[i%CHART_COLORS.length]+'"></i>'+esc(s.name||('系列'+(i+1)))+'</span>'
+  }).join('')+'</div>';
+}
+function chartLines(b){
+  let series=(b.series||[]).filter(function(s){return s&&(s.points||[]).length});
+  if(!series.length)return'';
+  // 汇集全部点求范围
+  let all=[],pointsOf=function(s){return s.points||[]};
+  series.forEach(function(s){all=all.concat(pointsOf(s))});
+  let x0=Math.min.apply(null,all.map(function(p){return p.x})),x1=Math.max.apply(null,all.map(function(p){return p.x}));
+  let y0=Math.min.apply(null,all.map(function(p){return p.y})),y1=Math.max.apply(null,all.map(function(p){return p.y}));
+  if(x0===x1){x0-=1;x1+=1}if(y0===y1){y0-=1;y1+=1}
+  let pad=(x1-x0)*.05,W=640,H=220,L=42,R=14,T=12,B=26;
+  let sx=function(x){return L+(x-x0)/(x1-x0)*(W-L-R)};
+  let sy=function(y){return T+(1-(y-y0)/(y1-y0))*(H-T-B)};
+  let svg='<svg viewBox="0 0 '+W+' '+H+'" xmlns="http://www.w3.org/2000/svg">';
+  // 网格 + y 轴刻度
+  for(let i=0;i<=4;i++){
+    let y=y0+(y1-y0)*i/4,yy=sy(y);
+    svg+='<line class="gl" x1="'+L+'" y1="'+yy+'" x2="'+(W-R)+'" y2="'+yy+'"/>';
+    svg+='<text class="ax" x="'+(L-6)+'" y="'+(yy+3)+'" text-anchor="end">'+fmtNum(y)+'</text>';
+  }
+  // x 轴刻度（最多 5 个）
+  let xt=Math.min(5,all.length);
+  for(let i=0;i<xt;i++){
+    let xi=Math.round(i*(all.length-1)/(xt-1||1)),x=all[xi].x;
+    svg+='<text class="ax" x="'+sx(x)+'" y="'+(H-8)+'" text-anchor="middle">'+fmtNum(x)+'</text>';
+  }
+  series.forEach(function(s,si){
+    let col=CHART_COLORS[si%CHART_COLORS.length];
+    let d=pointsOf(s).map(function(p,i){return(i?'L':'M')+sx(p.x)+' '+sy(p.y)}).join(' ');
+    svg+='<path d="'+d+'" fill="none" stroke="'+col+'" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>';
+    pointsOf(s).forEach(function(p){
+      svg+='<circle cx="'+sx(p.x)+'" cy="'+sy(p.y)+'" r="2.6" fill="'+col+'"/>';
+    });
+  });
+  svg+='</svg>';
+  return chartLegend(series)+svg;
+}
+function chartBars(b){
+  let bars=(b.bars||[]).filter(function(x){return x});
+  if(!bars.length)return'';
+  let max=Math.max.apply(null,bars.map(function(x){return x.value||0}))||1;
+  let W=640,H=220,L=42,R=14,T=16,B=34;
+  let n=bars.length,slot=(W-L-R)/n,bw=Math.min(64,slot*.62);
+  let svg='<svg viewBox="0 0 '+W+' '+H+'" xmlns="http://www.w3.org/2000/svg">';
+  for(let i=0;i<=4;i++){
+    let y=max*i/4,yy=T+(1-i/4)*(H-T-B);
+    svg+='<line class="gl" x1="'+L+'" y1="'+yy+'" x2="'+(W-R)+'" y2="'+yy+'"/>';
+    svg+='<text class="ax" x="'+(L-6)+'" y="'+(yy+3)+'" text-anchor="end">'+fmtNum(y)+'</text>';
+  }
+  bars.forEach(function(x,i){
+    let cx=L+slot*i+slot/2,h=(x.value/max)*(H-T-B),col=CHART_COLORS[i%CHART_COLORS.length];
+    let label=x.label||(''+(i+1));
+    svg+='<rect x="'+(cx-bw/2)+'" y="'+(T+H-T-B-h)+'" width="'+bw+'" height="'+h+'" rx="3" fill="'+col+'" opacity=".9"/>';
+    svg+='<text x="'+cx+'" y="'+(T+H-T-B-h-5)+'" text-anchor="middle" fill="#eaeaf0" font-size="10">'+fmtNum(x.value)+'</text>';
+    // 柱底标签：过长则截断
+    let t=label.length>8?label.slice(0,8)+'…':label;
+    if(n<=12)svg+='<text class="ax" x="'+cx+'" y="'+(H-8)+'" text-anchor="middle">'+esc(t)+'</text>';
+  });
+  svg+='</svg>';
+  let legend=chartLegend(bars.map(function(x,i){return{name:x.label}}));
+  return legend+svg;
+}
+function chartScatter(b){
+  let series=(b.series||[]).filter(function(s){return s&&(s.points||[]).length});
+  if(!series.length)return'';
+  let all=[];series.forEach(function(s){all=all.concat(s.points)});
+  let x0=Math.min.apply(null,all.map(function(p){return p.x})),x1=Math.max.apply(null,all.map(function(p){return p.x}));
+  let y0=Math.min.apply(null,all.map(function(p){return p.y})),y1=Math.max.apply(null,all.map(function(p){return p.y}));
+  if(x0===x1){x0-=1;x1+=1}if(y0===y1){y0-=1;y1+=1}
+  let W=640,H=220,L=42,R=14,T=12,B=26;
+  let sx=function(x){return L+(x-x0)/(x1-x0)*(W-L-R)};
+  let sy=function(y){return T+(1-(y-y0)/(y1-y0))*(H-T-B)};
+  let svg='<svg viewBox="0 0 '+W+' '+H+'" xmlns="http://www.w3.org/2000/svg">';
+  for(let i=0;i<=4;i++){
+    let y=y0+(y1-y0)*i/4,yy=sy(y);
+    svg+='<line class="gl" x1="'+L+'" y1="'+yy+'" x2="'+(W-R)+'" y2="'+yy+'"/>';
+    svg+='<text class="ax" x="'+(L-6)+'" y="'+(yy+3)+'" text-anchor="end">'+fmtNum(y)+'</text>';
+  }
+  series.forEach(function(s,si){
+    let col=CHART_COLORS[si%CHART_COLORS.length];
+    s.points.forEach(function(p){
+      svg+='<circle cx="'+sx(p.x)+'" cy="'+sy(p.y)+'" r="3.4" fill="'+col+'" opacity=".85"/>';
+    });
+  });
+  svg+='</svg>';
+  return chartLegend(series)+svg;
+}
+function fmtNum(v){
+  v=Number(v);if(!isFinite(v))return'';
+  if(Math.abs(v)>=1000)return(v/1000).toFixed(1)+'k';
+  return String(Math.round(v*100)/100);
+}
+
+// ── process 块：进程列表（带状态点） ──
+function renderProcess(b){
+  let items=(b.data&&b.data.processes)||b.items||[];
+  if(items.length){
+    // 数据驱动列：取首元素键作列头（有偏好顺序则用之）
+    let order=b.headers||['ticket_id','pid','sandboxed','cgroup','name','command','state'];
+    let keys=order.filter(function(k){return k in items[0]});
+    if(!keys.length)keys=Object.keys(items[0]);
+    let fmt=function(v){
+      if(v===null||v===undefined)return'—';
+      if(typeof v==='boolean')return v?'yes':'';
+      if(typeof v==='object'){try{return JSON.stringify(v)}catch(e){return'…'}}
+      return String(v);
+    };
+    let rows=items.map(function(p){return keys.map(function(k){return fmt(p[k])})});
+    let html='<table class="blk-tbl"><tr>';
+    keys.forEach(function(x){html+='<th>'+esc(x)+'</th>'});
+    html+='</tr>';
+    rows.forEach(function(row){html+='<tr>';row.forEach(function(c){html+='<td>'+esc(c)+'</td>'});html+='</tr>'});
+    return html+'</table>';
+  }
+  let lines=b.data||b;
+  if(lines&&lines.raw)return'<div class="blk-term">'+esc(lines.raw)+'</div>';
+  return'<div class="blk-md">'+md(b.markdown||'进程状态')+'</div>';
 }
 
 // 用户点同意/拒绝 → 走 POST /api/action 恢复那次被挂起的工具调用
@@ -708,11 +960,65 @@ async function refreshToolsAndServices(){
 
 // utils
 function esc(s){let d=document.createElement('div');d.textContent=s||'';return d.innerHTML}
+// 属性专用转义：esc 已把 &<> 实体化，这里只补压双引号防属性逃逸
+function escA(s){return(s||'').replace(/"/g,'&quot;')}
+// 迷你 markdown 渲染器：AION 原生重排网页/文本内容的渲染内核。
+// 顺序：先抽出代码块 → 整段转义防注入 → 行内格式 → 逐行块结构。
 function md(s){
-  return(s||'').replace(/```(\w*)\n([\s\S]*?)```/g,function(_,l,c){return'<pre><code>'+esc(c)+'</code></pre>'})
-    .replace(/`([^`]+)`/g,'<code>$1</code>')
-    .replace(/\*\*(.*?)\*\*/g,'<strong>$1</strong>')
-    .replace(/\n/g,'<br>');
+  if(!s)return'';
+  let tokens=[];
+  // 1) 保护围栏代码块（内容可含换行/特殊字符）
+  let t=s.replace(/```([\w-]*)\n?([\s\S]*?)```/g,function(_,l,c){
+    let tok='@@C'+(tokens.length)+'@@';
+    tokens.push('<pre><code class="lang-'+esc(l||'')+'">'+esc(c)+'</code></pre>');
+    return tok;
+  });
+  // 2) 转义其余内容（防注入）
+  t=esc(t);
+  // 3) 行内格式：行内码 / 加粗 / 斜体 / 链接 / 图片
+  //    t 已整段 esc（&<> 已实体化），属性值只需 escA 压双引号防属性逃逸；
+  //    不可再整体 esc，否则 &amp; 会被二次编码成 &amp;amp;。
+  t=t.replace(/`([^`]+)`/g,'<code>$1</code>')
+    .replace(/\*\*([^*\n]+)\*\*/g,'<strong>$1</strong>')
+    .replace(/(^|[^*\w])\*([^*\n]+)\*(?!\*)/g,'$1<em>$2</em>')
+    .replace(/!\[([^\]]*)\]\((https?:[^)\s]+)\)/g,function(_,a,u){
+      return'<img src="'+escA(u)+'" alt="'+escA(a)+'" loading="lazy" onerror="this.style.display=\'none\'">';
+    })
+    .replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g,function(_,txt,u){
+      return'<a href="'+escA(u)+'" target="_blank" rel="noopener">'+txt+'</a>';
+    });
+  // 4) 逐行块结构
+  let html=[],para=[],inList=false,listTag='';
+  function flushPara(){if(para.length){html.push('<p>'+para.join('<br>')+'</p>');para=[]}}
+  function closeList(){if(inList){html.push(listTag==='ul'?'</ul>':'</ol>');inList=false}}
+  t.split('\n').forEach(function(line){
+    let ls=line.trim();
+    // 还原代码块 token
+    if(/^@@C\d+@@$/.test(ls)){flushPara();closeList();html.push(tokens[+ls.replace(/@@C(\d+)@@/,'$1')]);return}
+    if(!ls){flushPara();closeList();return}
+    let hd=ls.match(/^(#{1,6})\s+(.*)/);
+    if(hd){flushPara();closeList();html.push('<h'+hd[1].length+'>'+hd[2]+'</h'+hd[1].length+'>');return}
+    let hr=/^(-{3,}|\*{3,}|_{3,})$/.test(ls);
+    if(hr){flushPara();closeList();html.push('<hr>');return}
+    let bq=ls.match(/^&gt;\s?(.*)/); // 转义后 '>' 变 '&gt;'
+    if(bq){flushPara();closeList();html.push('<blockquote>'+bq[1]+'</blockquote>');return}
+    let ul=ls.match(/^[-*+]\s+(.*)/);
+    let ol=ls.match(/^\d+[.)]\s+(.*)/);
+    if(ul||ol){
+      flushPara();
+      let tag=ul?'ul':'ol';
+      if(!inList){inList=true;listTag=tag;html.push(tag==='ul'?'<ul>':'<ol>')}
+      html.push('<li>'+(ul?ul[1]:ol[1])+'</li>');
+      return;
+    }
+    if(inList)closeList();
+    para.push(line);
+  });
+  flushPara();closeList();
+  // 5) 还原行内残留 token（理论已全部处理，兜底）
+  html=html.join('');
+  html=html.replace(/@@C(\d+)@@/g,function(_,i){return tokens[+i]});
+  return html;
 }
 function fmtGB(b){if(!b)return'-';return(b/1073741824).toFixed(1)+'G'}
 function fmtUp(s){if(!s)return'-';let h=Math.floor(s/3600),m=Math.floor(s%3600/60);return h+'h'+m+'m'}

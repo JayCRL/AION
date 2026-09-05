@@ -469,6 +469,25 @@ async fn run_agentic_loop(
         tool_results: Vec::new(),
         paused: false,
     };
+
+    // 开发命令「渲染演示」：不调 LLM，直接铺出全部渲染器的样例块，供桌面/前端看画布富度
+    let last_user = new_history
+        .iter()
+        .rev()
+        .find(|m| m.role == "user")
+        .map(|m| m.content.trim())
+        .unwrap_or("");
+    if last_user == "渲染演示" || last_user == "render demo" {
+        let mut out = empty();
+        out.blocks = renderer_demo_blocks();
+        if let Some(t) = &tx {
+            for b in &out.blocks {
+                let _ = t.send(b.to_string());
+            }
+        }
+        new_history.push(ChatMessage::assistant("已展示全部渲染器样例。".to_string()));
+        return out;
+    }
     let model = match ctx.require::<ModelService>().await {
         Ok(m) => m,
         Err(e) => {
@@ -781,45 +800,11 @@ fn result_to_blocks(tu: &ToolUseBlock, result_json: &serde_json::Value) -> Vec<s
             vec![serde_json::json!({ "type": "text", "markdown": md })]
         }
         "system.stats" => {
-            let mut lines: Vec<String> = Vec::new();
-            let gb = |b: u64| format!("{:.1} GB", b as f64 / 1_073_741_824.0);
-            if let Some(m) = data.get("memory") {
-                let total = m.get("total_bytes").and_then(|v| v.as_u64()).unwrap_or(0);
-                let avail = m
-                    .get("available_bytes")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-                let used = total.saturating_sub(avail);
-                let pct = if total > 0 {
-                    used as f64 / total as f64 * 100.0
-                } else {
-                    0.0
-                };
-                lines.push(format!("内存：{} / {}（已用 {pct:.0}%）", gb(used), gb(total)));
-            }
-            if let Some(l) = data.get("load") {
-                let a = l.get("load1").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                let b = l.get("load5").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                let c = l.get("load15").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                lines.push(format!("负载：{a:.2} / {b:.2} / {c:.2}"));
-            }
-            if let Some(c) = data.get("cpu") {
-                let user = c.get("user").and_then(|v| v.as_u64()).unwrap_or(0);
-                let sys = c.get("system").and_then(|v| v.as_u64()).unwrap_or(0);
-                let idle = c.get("idle").and_then(|v| v.as_u64()).unwrap_or(0);
-                lines.push(format!("CPU ticks：user {user} / sys {sys} / idle {idle}"));
-            }
-            if let Some(u) = data.get("uptime_seconds").and_then(|v| v.as_f64()) {
-                let d = (u / 86_400.0) as u64;
-                let h = ((u % 86_400.0) / 3_600.0) as u64;
-                let m = ((u % 3_600.0) / 60.0) as u64;
-                lines.push(format!("运行时长：{d} 天 {h} 小时 {m} 分"));
-            }
-            if lines.is_empty() {
-                let pretty = serde_json::to_string_pretty(&data).unwrap_or_default();
-                lines.push(pretty);
-            }
-            vec![serde_json::json!({ "type": "text", "markdown": lines.join("\n") })]
+            // 富 stats 网格块：前端 renderStats 把 cpu/memory/load/uptime 画成实时面板
+            vec![serde_json::json!({
+                "type": "stats",
+                "data": data,
+            })]
         }
         _ => {
             let pretty = serde_json::to_string_pretty(&data).unwrap_or_default();
@@ -830,6 +815,94 @@ fn result_to_blocks(tu: &ToolUseBlock, result_json: &serde_json::Value) -> Vec<s
             })]
         }
     }
+}
+
+/// 「渲染演示」用的样例块：每种 UIBlock 渲染器各出一块，前端一次铺开看画布富度。
+fn renderer_demo_blocks() -> Vec<serde_json::Value> {
+    vec![
+        serde_json::json!({ "type": "text", "markdown": "**文本块** · 内联 markdown，`等宽` 也行" }),
+        serde_json::json!({
+            "type": "markdown",
+            "source": "# 一级标题\n\n正文段落，支持 **加粗**、*斜体*、`行内码`。\n\n- 列表项 A\n- 列表项 B\n- 列表项 C\n\n> 引用：这是网页正文经 AION 原生重排后的样子。\n\n[链接 → 武科大官网](https://www.wust.edu.cn)"
+        }),
+        serde_json::json!({
+            "type": "table",
+            "headers": ["名称", "类型", "大小"],
+            "rows": [
+                ["index.html", "file", "28.6K"],
+                ["bg-wust.jpg", "file", "459.1K"],
+                ["assets", "dir", "-"],
+                ["src", "dir", "-"],
+            ],
+            "caption": "文件列表 · 4 项",
+        }),
+        serde_json::json!({
+            "type": "terminal",
+            "command": "uname -a",
+            "output": "Linux aion-host 6.1.0-20-amd64 #1 SMP x86_64 GNU/Linux",
+            "code": 0,
+        }),
+        serde_json::json!({
+            "type": "chart",
+            "kind": "line",
+            "title": "CPU 负载趋势",
+            "series": [
+                { "name": "user", "points": [{ "x": 0, "y": 12 }, { "x": 1, "y": 25 }, { "x": 2, "y": 18 }, { "x": 3, "y": 40 }, { "x": 4, "y": 33 }] },
+                { "name": "system", "points": [{ "x": 0, "y": 5 }, { "x": 1, "y": 8 }, { "x": 2, "y": 15 }, { "x": 3, "y": 12 }, { "x": 4, "y": 20 }] }
+            ],
+        }),
+        serde_json::json!({
+            "type": "chart",
+            "kind": "bar",
+            "title": "内存占用（GB）",
+            "bars": [
+                { "label": "已用", "value": 7.2 },
+                { "label": "缓存", "value": 3.1 },
+                { "label": "可用", "value": 4.5 },
+                { "label": "Swap", "value": 1.2 }
+            ],
+        }),
+        serde_json::json!({
+            "type": "chart",
+            "kind": "points",
+            "title": "采样散点",
+            "series": [
+                { "name": "cpu vs io", "points": [{ "x": 1, "y": 2 }, { "x": 2, "y": 5 }, { "x": 3, "y": 3 }, { "x": 4, "y": 8 }, { "x": 5, "y": 6 }] }
+            ],
+        }),
+        serde_json::json!({
+            "type": "image",
+            "src": "/logo.png",
+            "alt": "AION 徽标（本地资源示例）",
+            "width": 200,
+        }),
+        serde_json::json!({
+            "type": "file",
+            "path": "/home/wust_1/AION/README.md",
+            "kind": "source",
+            "mime": "text/markdown",
+            "size": 2048,
+        }),
+        serde_json::json!({
+            "type": "stats",
+            "data": {
+                "cpu": { "user": 8, "nice": 0, "system": 3, "idle": 85, "iowait": 0 },
+                "memory": { "total_bytes": 17_179_869_184_i64, "available_bytes": 8_388_608_000_i64 },
+                "load": { "load1": 0.42, "load5": 0.35, "load15": 0.3 },
+                "uptime_seconds": 3723.0
+            },
+        }),
+        serde_json::json!({
+            "type": "process",
+            "data": {
+                "processes": [
+                    { "pid": 1, "name": "systemd", "state": "running" },
+                    { "pid": 1200, "name": "aion-web", "state": "running" },
+                    { "pid": 1242, "name": "aion-desktop", "state": "running" }
+                ]
+            },
+        }),
+    ]
 }
 
 async fn api_chat(
