@@ -7,6 +7,7 @@
 //!
 //! Tool trait 签名按 Phase 1 已锁定的版本：见 [`Tool`]。
 
+pub mod app;
 pub mod file;
 pub mod process;
 pub mod risk;
@@ -281,6 +282,7 @@ pub fn populate_builtin_registry(reg: &ToolRegistry) -> CordisResult<()> {
         CordisError::Custom(format!("builtin tool register: {e}"))
     }
 
+    reg.register(app::AppOpenTool::new()).map_err(err)?;
     reg.register(file::FileReadTool::new()).map_err(err)?;
     reg.register(file::FileWriteTool::new()).map_err(err)?;
     reg.register(file::FileListTool::new()).map_err(err)?;

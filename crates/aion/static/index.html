@@ -108,6 +108,13 @@ body.lite .input-box{background:rgba(255,255,255,.09);border-color:rgba(255,255,
 .btn-d{background:var(--err);color:#fff}
 .btn-g{background:var(--bg3);color:var(--txt2);border:1px solid var(--glass-brd)}
 
+/* 已用外部阅读器打开的被动横幅（无按钮、非警告色） */
+.blk-launch{display:flex;align-items:center;gap:12px;background:var(--bg2);border:1px solid var(--glass-brd);border-left:3px solid var(--acc);border-radius:var(--r);padding:12px 14px;margin:8px 0}
+.blk-launch .l-icon{font-size:20px;line-height:1}
+.blk-launch .l-title{font-size:13.5px;color:var(--txt);font-weight:500}
+.blk-launch .l-title b{color:var(--acc)}
+.blk-launch .l-path{font-size:11.5px;color:var(--txt2);margin-top:2px;font-family:ui-monospace,Menlo,monospace;word-break:break-all}
+
 /* ── rich blocks: chart / image / file / markdown / stats ── */
 .blk-cap{font-size:11px;color:var(--txt2);margin:4px 2px 10px}
 .blk-chart{background:var(--bg2);border:1px solid var(--glass-brd);border-radius:12px;padding:14px 16px;margin:8px 0}
@@ -724,8 +731,22 @@ function renderBlock(b){
     case'process':return renderProcess(b);
     case'webpage':return renderWebpage(b);
     case'page':return renderPage(b);
+    case'launch':return renderLaunch(b);
     default:return'';
   }
+}
+
+// 「已用外部阅读器打开」被动横幅：AION 决定用哪个已装程序(vlc/evince/libreoffice…)
+// 打开本地媒体/PDF/Office 文件，窗口已弹到桌面；这条只告知，不交互、无按钮。
+function renderLaunch(b){
+  let app=b.app||'外部程序';
+  let icon=b.icon||'📄';
+  let h='<div class="blk-launch">';
+  h+='<div class="l-icon">'+esc(icon)+'</div>';
+  h+='<div class="l-body"><div class="l-title">已用 <b>'+esc(app)+'</b> 打开</div>';
+  if(b.path)h+='<div class="l-path">'+esc(b.path)+'</div>';
+  h+='</div></div>';
+  return h;
 }
 
 // 网页感卡片渲染器：AION 自己把站点结构排成原生 DOM（顶栏导航/hero logo/

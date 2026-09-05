@@ -32,7 +32,8 @@ pub mod tool;
 use aion_adapter::AdapterKit;
 
 pub use capability::{
-    register_builtin_capabilities, CapabilityRegistry, ResolvedProvider,
+    image_mime, is_external_ext, is_text_ext, lower_ext, register_builtin_capabilities,
+    viewer_icon, CapabilityRegistry, ResolvedProvider,
 };
 pub use error::{AionError, AionResult};
 pub use provider::{backend_from_provider, LlmProtocol, LlmProvider, LlmProviderStore};

@@ -23,7 +23,7 @@ use tower_http::cors::CorsLayer;
 use aion_protocol::llm_schema::{capability_to_anthropic, tool_to_anthropic};
 use aion_protocol::prelude::*;
 
-use aion_services::capability::CapabilityRegistry;
+use aion_services::capability::{image_mime, lower_ext, viewer_icon, CapabilityRegistry};
 use aion_services::model::{
     ChatMessage, ModelService, ToolResultBlock, ToolUseBlock,
 };
@@ -33,7 +33,13 @@ use aion_services::{
 };
 
 /// Capability 已覆盖的叶子工具：不再直接暴露给模型（能力内部按 URL/意图解析选择）。
-const PROVIDER_ONLY_TOOLS: [&str; 2] = ["web.fetch", "web.read"];
+const PROVIDER_ONLY_TOOLS: [&str; 5] = [
+    "web.fetch",
+    "web.read",
+    "file.read",
+    "file.list",
+    "app.open",
+];
 
 /// 一条等待用户确认的挂起命令（登记于 `AppState.pending`）。
 struct PendingApproval {
@@ -572,6 +578,33 @@ async fn run_agentic_loop(
         new_history.push(ChatMessage::assistant(format!("已读取 {pop_url} 并入画布。")));
         return out;
     }
+    // 开发命令「看文件 / 弹文件 <本地路径>」：确定性走 file.view 全链路
+    // （能力 → resolver 按类型选 file.read/file.list/app.open → 投影）。
+    if let Some(fpath) = parse_dev_file(&last_user) {
+        let mut out = empty();
+        let cap_tu = ToolUseBlock {
+            id: CallId::new().as_str().to_string(),
+            name: "file.view".into(),
+            input: serde_json::json!({ "path": fpath }),
+        };
+        let tu = resolve_leaf_tu(&state.capabilities, &cap_tu);
+        let tc = ToolCall {
+            call_id: CallId::new(),
+            tool: tu.name.clone(),
+            arguments: tu.input.clone(),
+            sandbox: Some(ToolSandboxHint::Default),
+        };
+        let result = run_consented(state, ctx, runtime, sec, session_id, &tc).await;
+        let rj = serde_json::to_value(&result).unwrap_or(serde_json::Value::Null);
+        for b in result_to_blocks(&tu, &rj) {
+            out.blocks.push(b.clone());
+            if let Some(t) = &tx {
+                let _ = t.send(b.to_string());
+            }
+        }
+        new_history.push(ChatMessage::assistant(format!("已查看 {fpath} 并入画布。")));
+        return out;
+    }
     let model = match ctx.require::<ModelService>().await {
         Ok(m) => m,
         Err(e) => {
@@ -873,6 +906,26 @@ fn result_to_blocks(tu: &ToolUseBlock, result_json: &serde_json::Value) -> Vec<s
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
             let path = data.get("path").and_then(|v| v.as_str()).unwrap_or("文件");
+            // 图片：resolver 用 encoding=base64 取原始字节 → 原生 image 块(data URL)。
+            // 前端 renderImage 已能直接渲染 base64 data URL。
+            let enc = data
+                .get("encoding")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if enc == "base64" && !truncated {
+                let ext = lower_ext(path);
+                if let Some(mime) = image_mime(&ext) {
+                    return vec![serde_json::json!({
+                        "type": "image",
+                        "src": format!("data:{mime};base64,{content}"),
+                        "alt": path,
+                    })];
+                }
+            }
+            if enc == "base64" && truncated {
+                let md = format!("📄 `{path}`：图片超过 4MB 上限，未原生显示。");
+                return vec![serde_json::json!({ "type": "text", "markdown": md })];
+            }
             let md = if content.trim().is_empty() {
                 format!("📄 `{path}`：空文件（或不可读）")
             } else {
@@ -885,6 +938,18 @@ fn result_to_blocks(tu: &ToolUseBlock, result_json: &serde_json::Value) -> Vec<s
                 format!("📄 `{path}`\n\n```\n{body}{mark}\n```")
             };
             vec![serde_json::json!({ "type": "text", "markdown": md })]
+        }
+        "app.open" => {
+            // 外部阅读器已启动 → 被动横幅：谁 + 打开了什么文件
+            let path = data.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            let app = data.get("app").and_then(|v| v.as_str()).unwrap_or("");
+            let ext = data.get("ext").and_then(|v| v.as_str()).unwrap_or("");
+            vec![serde_json::json!({
+                "type": "launch",
+                "icon": viewer_icon(ext),
+                "app": app,
+                "path": path,
+            })]
         }
         "system.stats" => {
             // 富 stats 网格块：前端 renderStats 把 cpu/memory/load/uptime 画成实时面板
@@ -1008,6 +1073,25 @@ fn parse_dev_pop(msg: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+/// 开发命令「看文件 / 弹文件 <本地路径>」的解析：确定性走 file.view 链路。
+/// 只认绝对路径（`/…`）或主目录（`~/…`），避免误吞普通对话；非本地路径返回 None。
+fn parse_dev_file(msg: &str) -> Option<String> {
+    let msg = msg.trim();
+    for pre in ["看文件", "弹文件", "读文件", "查看文件"] {
+        let Some(rest) = msg.strip_prefix(pre) else {
+            continue;
+        };
+        let rest = rest
+            .trim_start_matches(|c| c == ':' || c == '：')
+            .trim();
+        if rest.starts_with('/') || rest.starts_with("~/") {
+            return Some(rest.to_string());
+        }
+        return None;
+    }
+    None
 }
 
 /// 「渲染演示」用的样例块：每种 UIBlock 渲染器各出一块，前端一次铺开看画布富度。
