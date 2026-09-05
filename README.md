@@ -24,6 +24,24 @@ AION 把 Agent 运行所需的「上下文、并发、隔离、权限、资源�
 - **适配层（AION Linux Adapter）**：封装 namespace / cgroup v2 / seccomp / capability / mount 等 Linux 系统调用；
 - **内核层（Linux Kernel）**：进程、文件系统、网络、资源控制、隔离、设备、安全（LSM/SELinux）。
 
+## 安装（Linux · 免编译）
+
+面向普通用户：**不需要 Rust、不需要编译**。预编译包在 [GitHub Releases](https://github.com/JayCRL/AION/releases)，
+`x86_64` / `aarch64` 各一个自包含压缩包（Web 前端已内嵌进二进制，解包即完整运行时）。
+
+```bash
+# 一行安装：拉最新版 install.sh 并执行 → ~/.local/bin + systemd 用户服务
+curl -fsSL https://github.com/JayCRL/AION/releases/latest/download/install.sh | bash
+```
+
+或手动下载：Releases 页取 `aion-x86_64-linux.tar.gz`（或 `aion-aarch64-linux.tar.gz`）→ 解包 → `./install.sh`。
+
+装完浏览器打开 **http://localhost:8080**，首次在 ⚙️ Settings → LLM 添加一个真实模型即可对话干活。
+全部装到用户目录、**免 root**；想让 AION 自动补装系统包（apt）可选配 `sudo -n` NOPASSWD。
+细节（能力依赖、一键补齐、卸载、换端口、安全说明）见 **[README.install.md](README.install.md)**。
+
+> 想自己编译、参与开发？跳到下方「从源码构建（开发者）」。
+
 ## 架构总览
 
 ![AION 架构总览](assets/architecture.png)
@@ -38,7 +56,9 @@ Agent 发起请求 → Cordis Context 获取 Service → AION Service 权限检�
 
 一次 `aion demo` 会逐步打印上述六个阶段（包括权限拒绝的负例），并演示事件流与 Effect 清理。
 
-## 快速开始
+## 从源码构建（开发者）
+
+普通用户装预编译包即可（见上）；这里给想自己编译、改内核、跑 CI 的人。
 
 ```bash
 # 构建并运行完整演示（Linux 下为真实沙箱；Windows/macOS 下为宿主模拟）
@@ -154,10 +174,14 @@ crates/
 | 进程 / 文件 / 网络 / 终端 | ✅ | ✅ | ✅ |
 | namespace 隔离 | ✅ | ➖ 自动跳过 | ❌（内存模拟或返回 Unsupported） |
 | seccomp / capability 收缩 | ✅ | ➖ 自动跳过 | ❌ |
-| cgroup v2 资源限制 | ✅ | 尽力而为（失败发警告事件） | ❌（内存模拟） |
+| cgroup v2 资源限制 | ✅ | 自动降级模拟（`EmulatedCgroupAdapter`） | ❌（内存模拟） |
 | 进程沙箱强制执行 | ✅ `sandboxed=true` | ⚠️ 仅 `no_new_privs` | ❌（`sandboxed=false`） |
 
-> 非 Linux 平台或 Linux 非 root 环境下运行时不会失败：cgroup 走 `EmulatedCgroupAdapter`，namespace/seccomp 报告不支持，沙箱是否真实执行通过 `sandboxed` 标记暴露给服务层与演示输出。
+> 任何环境都不会因沙箱能力不足而运行失败。Linux 非 root、容器或无 cgroup v2 写权限
+> （cgroup v1）时：cgroup 自动降级为 `EmulatedCgroupAdapter`（资源限制尽力而为，启动时
+> 一次性探测 `/sys/fs/cgroup` 是否可写，不再每次 spawn 失败告警）；namespace / seccomp /
+> capability 在无特权时自动跳过。`SandboxSupport`（`aion demo` 与启动日志）会如实标
+> `namespace ✗ · cgroup ✗` 而非虚报。
 
 ## 已在真内核验证
 
