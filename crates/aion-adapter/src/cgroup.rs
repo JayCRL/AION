@@ -1,7 +1,7 @@
 //! Cgroup 适配器：cgroup v2 资源控制（内存 / CPU / 进程数）。
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use async_trait::async_trait;
@@ -89,6 +89,42 @@ pub struct NativeCgroupAdapter {
 impl NativeCgroupAdapter {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         NativeCgroupAdapter { root: root.into() }
+    }
+
+    /// cgroup v2 是否对本进程**真实可用**（能建组实施资源限制）。
+    ///
+    /// 判据：`root` 是目录、带 cgroup v2 特征文件 `cgroup.controllers`（借此排除
+    /// cgroup v1 挂载点与不存在的情形），并且能在 `root` 下**实际建/删一个探针子目录**
+    /// ——验证当前用户对该树有写权限（root 运行、systemd 式 delegate，或挂载点放权）。
+    ///
+    /// 不满足的典型场景：容器（/sys/fs/cgroup 只读或未 delegate）、无特权普通用户桌面
+    /// （root 树归 root 不可写）、cgroup v1 机器。上层应据此把资源限制降级为
+    /// [`EmulatedCgroupAdapter`]（记录限制但**不假装强制**），而不是每次 spawn 都尝试
+    /// 失败告警。只读探测 + 一次建删，不残留。
+    #[cfg(target_os = "linux")]
+    pub fn usable(root: &Path) -> bool {
+        if !root.is_dir() {
+            return false;
+        }
+        // cgroup v1 的挂载根（/sys/fs/cgroup）没有这个特征文件；有它才是 v2。
+        if !root.join("cgroup.controllers").is_file() {
+            return false;
+        }
+        // 真实建组要求 root 树可写。建一个唯一探针目录再删掉：能建 = 可用。
+        // pid 参与命名，避免与本机其它 AION 实例的探针互相打架。
+        let probe = root.join(format!(".aion-cg-probe-{}", std::process::id()));
+        match std::fs::create_dir(&probe) {
+            Ok(()) => {
+                let _ = std::fs::remove_dir(&probe);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn usable(_root: &Path) -> bool {
+        false
     }
 
     #[allow(dead_code)]
@@ -242,6 +278,10 @@ impl CgroupAdapter for NativeCgroupAdapter {
 // ---------------------------------------------------------------------------
 
 /// 内存模拟适配器：记录句柄但不实际限制资源。
+///
+/// 用于非 Linux 平台，以及 Linux 上 `NativeCgroupAdapter::usable` 判定 cgroup v2
+/// 不可写时的降级（容器 / 无 delegate 的普通用户 / cgroup v1）——资源限制尽力而为，
+/// 由 `SandboxSupport` 如实上报 cgroup 未强制。
 #[derive(Default)]
 pub struct EmulatedCgroupAdapter {
     groups: Mutex<std::collections::BTreeMap<String, CgroupLimits>>,

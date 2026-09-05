@@ -55,7 +55,9 @@ pub type BoxFut<T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Sen
 
 /// 平台原生适配器组合。
 ///
-/// - Linux：cgroup/namespace/seccomp/capability 均为真实实现；
+/// - Linux：namespace/seccomp/capability 为真实实现；cgroup 视 `cgroup v2` 是否对本进程
+///   可用而定——可用用真实实现，否则（容器 / 无 delegate 的普通用户 / cgroup v1）自动
+///   降级为内存模拟，资源限制尽力而为、不假装强制（由 `SandboxSupport` 如实报告）；
 /// - 其他平台：cgroup 走内存模拟，namespace/seccomp/capability 报告不支持，
 ///   进程沙箱不被强制执行（由上层通过 `SpawnedProcess::sandboxed` 得知）。
 #[derive(Clone)]
@@ -96,10 +98,22 @@ impl AdapterKit {
             process: Arc::new(process::NativeProcessAdapter),
             fs: Arc::new(fs::NativeFsAdapter),
             net: Arc::new(net::NativeNetAdapter),
-            cgroup: if cfg!(target_os = "linux") {
-                Arc::new(cgroup::NativeCgroupAdapter::new(cgroup_root))
-            } else {
-                Arc::new(cgroup::EmulatedCgroupAdapter::default())
+            cgroup: {
+                // Linux：cgroup v2 对本进程真实可用 → 真实适配器；否则降级为内存模拟
+                // （容器 / 无 delegate 的普通用户 / cgroup v1），资源限制尽力而为。
+                #[cfg(target_os = "linux")]
+                {
+                    if cgroup::NativeCgroupAdapter::usable(&cgroup_root) {
+                        Arc::new(cgroup::NativeCgroupAdapter::new(cgroup_root))
+                    } else {
+                        Arc::new(cgroup::EmulatedCgroupAdapter::default())
+                    }
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    let _ = &cgroup_root;
+                    Arc::new(cgroup::EmulatedCgroupAdapter::default())
+                }
             },
             namespace: Arc::new(namespace::NativeNamespaceAdapter),
             seccomp: Arc::new(seccomp::NativeSeccompAdapter),
@@ -109,9 +123,13 @@ impl AdapterKit {
     }
 
     /// 当前平台的沙箱能力报告。
+    ///
+    /// `namespaces` 额外叠加「当前进程实际能否创建非 user namespace」——适配器在 Linux
+    /// 上总是 *supported*，但无特权用户无法 `unshare`（需 CAP_SYS_ADMIN）。不叠加会导致
+    /// rootless 桌面机 over-report「隔离 ✓」而实际降级运行。cgroup 同理看是否已降级模拟。
     pub fn sandbox_support(&self) -> sandbox::SandboxSupport {
         sandbox::SandboxSupport {
-            namespaces: self.namespace.supported(),
+            namespaces: self.namespace.supported() && namespace::can_create_namespaces(),
             cgroup_enforced: !self.cgroup.is_emulated(),
             seccomp: self.seccomp.supported(),
             capabilities: self.capability.supported(),
