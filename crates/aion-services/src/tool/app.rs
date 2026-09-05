@@ -96,50 +96,86 @@ fn ensure_display_env(cmd: &mut std::process::Command) {
     }
 }
 
-/// 用 yt-dlp 把站点页面 URL 解析成可直接播放的媒体直链（≤25s）。
-/// yt-dlp 缺失 / 失败 / 超时 → None，调用方回退原 URL（直链媒体 mpv 仍能直接放）。
+/// 用 yt-dlp 把站点页面 URL 解析成可直接播放的媒体直链。
+///
+/// B 站等视频站的抗爬会**随机 412**：同一 URL 这次被拒、下次就成。故整段最多尝试
+/// `MAX_TRIES` 次，每次起一个全新 yt-dlp 进程（= 全新 buvid cookie，等于一次新机会）。
+/// yt-dlp 缺失 / 全部失败 / 超时 → None，调用方回退原 URL（纯直链媒体 mpv 仍能直接放）。
 fn resolve_media_url(raw: &str) -> Option<String> {
     use std::io::Read;
     use std::process::Stdio;
     use std::time::{Duration, Instant};
 
-    let Ok(mut child) = std::process::Command::new("yt-dlp")
-        .args([
-            "-g",
-            "--no-warnings",
-            "--no-playlist",
-            "--format",
-            "best[height<=720]/best",
-            raw,
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-    else {
-        return None;
-    };
-    let start = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(st)) if st.success() => break,
-            Ok(Some(_)) => return None,
-            Ok(None) => {}
-            Err(_) => return None,
-        }
-        if start.elapsed() >= Duration::from_secs(25) {
-            let _ = child.kill();
-            let _ = child.wait();
+    const MAX_TRIES: u32 = 4; // 412 是概率性失败，重试几次即收敛（成功那跑 ~1s）
+    const PER_TRY: Duration = Duration::from_secs(10);
+
+    for _ in 0..MAX_TRIES {
+        let Ok(mut child) = std::process::Command::new("yt-dlp")
+            .args([
+                "-g",
+                "--no-warnings",
+                "--no-playlist",
+                "--format",
+                "best[height<=720]/best",
+                raw,
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+        else {
             return None;
+        };
+        let start = Instant::now();
+        let mut got_url = false;
+        loop {
+            match child.try_wait() {
+                Ok(Some(st)) if st.success() => {
+                    got_url = true;
+                    break;
+                }
+                Ok(Some(_)) => break, // 本次失败（多半 412）→ 外层重试
+                Ok(None) => {}
+                Err(_) => break,
+            }
+            if start.elapsed() >= PER_TRY {
+                let _ = child.kill();
+                let _ = child.wait();
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(200));
         }
-        std::thread::sleep(Duration::from_millis(200));
+        if !got_url {
+            continue;
+        }
+        let mut s = String::new();
+        let mut out = child.stdout.take()?;
+        out.read_to_string(&mut s).ok()?;
+        if let Some(url) = s.lines().map(str::trim).find(|l| {
+            !l.is_empty() && (l.starts_with("http://") || l.starts_with("https://"))
+        }) {
+            return Some(url.to_string());
+        }
     }
-    let mut s = String::new();
-    let mut out = child.stdout.take()?;
-    out.read_to_string(&mut s).ok()?;
-    s.lines()
-        .map(str::trim)
-        .find(|l| !l.is_empty() && (l.starts_with("http://") || l.starts_with("https://")))
-        .map(str::to_string)
+    None
+}
+
+/// 取一个 http(s) URL 的 origin（`scheme://host`），无 scheme / host 返回 None。
+fn origin_of(raw: &str) -> Option<String> {
+    let s = raw.trim();
+    let scheme_end = s.find("://")?;
+    let scheme = &s[..scheme_end];
+    if scheme != "http" && scheme != "https" {
+        return None;
+    }
+    let after = &s[scheme_end + 3..];
+    let host_end = after
+        .find(|c| c == '/' || c == '?' || c == '#')
+        .unwrap_or(after.len());
+    let host = &after[..host_end];
+    if host.is_empty() {
+        return None;
+    }
+    Some(format!("{scheme}://{host}"))
 }
 
 fn is_exec(p: &Path) -> bool {
@@ -275,14 +311,29 @@ impl Tool for AppOpenTool {
         };
 
         // URL 先经 yt-dlp 解直链（站点视频才能放）；失败退回原 URL（纯直链媒体仍可）。
-        let play_arg = if is_url {
-            resolve_media_url(&path).unwrap_or_else(|| path.clone())
-        } else {
-            path.clone()
-        };
+        let mut play_arg = path.clone();
+        if is_url {
+            if let Some(direct) = resolve_media_url(&path) {
+                play_arg = direct;
+            }
+        }
         let mut cmd = std::process::Command::new(&bin);
         cmd.arg(&play_arg);
         ensure_display_env(&mut cmd);
+        // 站点直链普遍防盗链：B 站 m4s 不带 Referer 裸放会 403。mpv 用 --http-header-fields
+        // 附上原页面 URL 的 origin（对不需要防盗链的纯直链媒体也无害）。只在「解析出真直链」
+        // 时加——回退原页面 URL 时加了也没用（页面本身还须过反爬）。
+        if is_url && play_arg != path {
+            let is_mpv = Path::new(&bin)
+                .file_name()
+                .map(|f| f == "mpv")
+                .unwrap_or(false);
+            if is_mpv {
+                if let Some(origin) = origin_of(&path) {
+                    cmd.arg(format!("--http-header-fields=Referer: {origin}/"));
+                }
+            }
+        }
         match cmd.spawn() {
             Ok(_) => ToolResult::success(json!({
                 "path": path,
