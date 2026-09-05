@@ -46,6 +46,11 @@ curl -fsSL https://github.com/JayCRL/AION/releases/latest/download/install.sh | 
 
 ![AION 架构总览](assets/architecture.png)
 
+图中「② 能力主线 · Capability」与「③ 叶子工具 · Tool Provider」对应新版分层：Agent 不再直接面对
+零散工具，而是通过能力（`web.view` / `file.view` / `media.view`）发起请求，由 Capability 的 Resolver
+解析成具体叶子工具执行。图源为 `assets/architecture.html`，用 Moli 无头引擎
+（`moli fetch --layout --dump screenshot_full`）截图再生成 `assets/architecture.png`。
+
 ## 调用流程
 
 ```

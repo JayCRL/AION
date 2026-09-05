@@ -1,0 +1,307 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>AION 架构总览</title>
+<style>
+  /* ============ AION 架构图 ============
+     源文件：用 moli 截图再生成 assets/architecture.png
+     画布固定 1920 宽（对应 moli 默认视口），高度自适应整页截图。
+     ===================================== */
+  :root{
+    --bg:#050508; --panel:#0c0d16; --panel2:#10121d;
+    --line:#23263a; --line2:#1a1d2e;
+    --txt:#e9ebf5; --muted:#97a0b6; --dim:#6a7190;
+    --purple:#7c6ee4;  /* AION 主色 */
+    --violet:#a78bfa;  /* Agents */
+    --amber:#fbbf24;   /* Capability 主线 */
+    --cyan:#22d3ee;    /* 叶子 Tool */
+    --blue:#60a5fa;    /* Services */
+    --green:#34d399;   /* Adapter */
+    --pink:#f472b6;    /* Kernel */
+  }
+  *{box-sizing:border-box; margin:0; padding:0;}
+  html,body{width:1920px;}
+  body{
+    background:var(--bg);
+    color:var(--txt);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Noto Sans CJK SC","Noto Sans SC","Microsoft YaHei",sans-serif;
+    font-size:20px; line-height:1.35;
+    -webkit-font-smoothing:antialiased;
+  }
+  .canvas{ padding:44px 52px 40px; }
+
+  /* ---------- 顶栏 ---------- */
+  .top{ display:flex; align-items:center; justify-content:space-between; gap:30px; }
+  .brand{ display:flex; align-items:center; gap:18px; }
+  .mark{
+    font-weight:800; font-size:44px; letter-spacing:1px;
+    background:linear-gradient(120deg,#a78bfa,#7c6ee4 55%,#60a5fa);
+    -webkit-background-clip:text; background-clip:text; color:transparent;
+  }
+  .sub{ color:var(--muted); font-size:19px; margin-top:2px; }
+  .entry{ display:flex; gap:16px; align-items:flex-end; }
+  .entrybox{
+    text-align:center; padding:14px 20px 12px; min-width:250px;
+    border:1px solid var(--line2); border-top:3px solid var(--violet);
+    border-radius:14px; background:linear-gradient(180deg,var(--panel2),var(--panel));
+  }
+  .entrybox .t{ font-size:20px; font-weight:600; color:var(--txt); }
+  .entrybox .d{ font-size:15px; color:var(--dim); margin-top:4px; font-family:ui-monospace,Menlo,Consolas,monospace; }
+  .arrow-down{ text-align:center; color:var(--violet); font-size:26px; line-height:1; margin:6px 0 -2px; }
+
+  /* ---------- 层 ---------- */
+  .layer{
+    border:1px solid var(--line); border-radius:18px;
+    background:linear-gradient(180deg,var(--panel),var(--panel) 60%, rgba(255,255,255,.012));
+    padding:18px 24px 20px; margin-top:20px; position:relative;
+  }
+  .layer > .accentbar{
+    position:absolute; left:0; top:14px; bottom:14px; width:5px; border-radius:0 4px 4px 0;
+  }
+  .layer .head{ display:flex; align-items:baseline; gap:14px; flex-wrap:wrap; }
+  .badge{
+    display:inline-flex; align-items:center; gap:10px;
+    font-size:23px; font-weight:700; color:var(--txt);
+  }
+  .num{
+    display:inline-flex; align-items:center; justify-content:center;
+    min-width:30px; height:30px; padding:0 2px; border-radius:9px;
+    font-size:16px; font-weight:800; color:#0a0a12;
+  }
+  .tagline{ color:var(--muted); font-size:17px; }
+  .headnote{ margin-left:auto; color:var(--dim); font-size:16px; text-align:right; }
+
+  .chips{ display:flex; flex-wrap:wrap; gap:10px; margin-top:14px; }
+  .chip{
+    display:inline-flex; align-items:center; gap:8px;
+    padding:8px 14px; border-radius:10px; font-size:18.5px;
+    border:1px solid rgba(255,255,255,.09); background:rgba(255,255,255,.03);
+  }
+  .chip b{ font-weight:600; }
+  .chip .en{ font-family:ui-monospace,Menlo,Consolas,monospace; font-size:16.5px; color:var(--muted); }
+  .sep{ color:var(--dim); }
+
+  /* ---------- 能力主线：解析微流程 ---------- */
+  .resolveflow{ display:flex; flex-wrap:wrap; align-items:center; gap:8px; margin:16px 0 4px; }
+  .rfbox{
+    padding:7px 13px; border-radius:9px; font-size:16.5px;
+    border:1px solid rgba(251,191,36,.28); background:rgba(251,191,36,.07); color:#fde68a;
+  }
+  .rfbox.gray{ border-color:var(--line2); background:var(--panel2); color:var(--muted); }
+  .rfarr{ color:var(--amber); font-size:20px; font-weight:800; }
+
+  /* ---------- 能力卡片 ---------- */
+  .capcards{ display:grid; grid-template-columns:repeat(3,1fr); gap:16px; margin-top:14px; }
+  .cap{
+    border:1px solid rgba(251,191,36,.30); border-radius:14px; padding:14px 16px 13px;
+    background:linear-gradient(180deg,rgba(251,191,36,.055),rgba(255,255,255,.01));
+  }
+  .cap .capname{ font-size:21px; font-weight:700; color:var(--amber); font-family:ui-monospace,Menlo,Consolas,monospace; }
+  .cap .capdesc{ color:var(--muted); font-size:16px; margin:2px 0 9px; }
+  .cap .prov{ color:var(--dim); font-size:15.5px; margin-top:7px; }
+  .prov b{ color:var(--cyan); font-weight:600; font-family:ui-monospace,Menlo,Consolas,monospace; font-size:15.5px;}
+  .cap .arrow{ color:var(--amber); }
+
+  /* ---------- 调用流程 ---------- */
+  .flow{
+    margin-top:22px; border:1px solid var(--line); border-radius:16px;
+    padding:16px 22px; background:linear-gradient(90deg,var(--panel2),var(--panel));
+  }
+  .flow .flabel{ color:var(--dim); font-size:15.5px; letter-spacing:2px; margin-bottom:10px; }
+  .flowrow{ display:flex; flex-wrap:wrap; align-items:center; gap:8px; }
+  .fnode{
+    padding:9px 14px; border-radius:10px; font-size:17px;
+    border:1px solid rgba(124,110,228,.35); background:rgba(124,110,228,.09);
+  }
+  .fnode b{ font-weight:700; }
+  .fnode .en{ color:var(--muted); font-size:15px; font-family:ui-monospace,Menlo,Consolas,monospace; }
+  .farr{ color:var(--purple); font-size:19px; font-weight:800; }
+  .fnode.result{ border-color:rgba(52,211,153,.4); background:rgba(52,211,153,.08); color:#d1fae5; }
+</style>
+</head>
+<body>
+<div class="canvas">
+
+  <!-- ===== 顶栏 ===== -->
+  <div class="top">
+    <div>
+      <div class="mark">AION</div>
+      <div class="sub">Agent OS Runtime · 一条 Agent 请求如何落成一台 Linux 机器上的系统调用</div>
+    </div>
+    <div class="entry">
+      <div class="entrybox">
+        <div class="t">Web UI</div>
+        <div class="d">aion web · :18080（内嵌前端 + 桌面壳）</div>
+        <div class="arrow-down">▼</div>
+      </div>
+      <div class="entrybox">
+        <div class="t">CLI</div>
+        <div class="d">aion demo · repl · run · services</div>
+        <div class="arrow-down">▼</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== ① 应用层 ===== -->
+  <div class="layer">
+    <div class="accentbar" style="background:var(--violet)"></div>
+    <div class="head">
+      <div class="badge"><span class="num" style="background:var(--violet)">①</span>应用层 · Agents &amp; Apps</div>
+      <div class="tagline">Agent 通过 Context 发起请求，先落到「能力」再落工具</div>
+      <div class="headnote">多 LLM 供应商后端（OpenAI / Anthropic 兼容）统一由 model 服务接入</div>
+    </div>
+    <div class="chips">
+      <span class="chip"><b>Coder</b><span class="en">写代码 · 跑命令</span></span>
+      <span class="chip"><b>Research</b><span class="en">研究 · 检索</span></span>
+      <span class="chip"><b>Assistant</b><span class="en">对话助手</span></span>
+      <span class="chip"><b>Browser</b><span class="en">浏览器体感 Agent</span></span>
+      <span class="chip"><b>Custom</b><span class="en">自定义</span></span>
+      <span class="sep">|</span>
+      <span class="chip"><span class="en">Cordis Context / Fiber / Effect / Scope</span></span>
+    </div>
+  </div>
+
+  <!-- ===== ② Capability 能力主线 ===== -->
+  <div class="layer" style="border-color:rgba(251,191,36,.32)">
+    <div class="accentbar" style="background:var(--amber)"></div>
+    <div class="head">
+      <div class="badge"><span class="num" style="background:var(--amber)">②</span>能力主线 · Capability</div>
+      <div class="tagline">「让 Agent 知道能做什么」——定义 + Resolver 注册表，把能力调用解析成叶子工具</div>
+      <div class="headnote">可开关（能力广场）· 依赖扫描 / 一键补装 · 缺依赖自动弹确认门</div>
+    </div>
+
+    <div class="resolveflow">
+      <span class="rfbox">Agent 能力请求<br><span style="color:var(--dim)">名称 + 输入</span></span>
+      <span class="rfarr">→</span>
+      <span class="rfbox">Resolver<br><span style="color:var(--dim)">CapabilityRegistry · 定义+解析器成对</span></span>
+      <span class="rfarr">→</span>
+      <span class="rfbox gray">ResolvedProvider<br><span style="color:var(--dim)">{ tool, arguments }</span></span>
+      <span class="rfarr">→</span>
+      <span class="rfbox gray">叶子 Tool 执行<br><span style="color:var(--dim)">ToolRuntime（风险 / 权限门）</span></span>
+    </div>
+
+    <div class="capcards">
+      <div class="cap">
+        <div class="capname">web.view</div>
+        <div class="capdesc">浏览 / 查看网页（站点皮肤自动选）</div>
+        <div class="prov"><span class="arrow">↳</span> 原生重排：<b>web.fetch</b></div>
+        <div class="prov"><span class="arrow">↳</span> SPA/动态站：<b>web.read</b>（Moli 无头引擎取正文）</div>
+      </div>
+      <div class="cap">
+        <div class="capname">file.view</div>
+        <div class="capdesc">读文件 / 目录 / 文本，交给本机应用打开</div>
+        <div class="prov"><span class="arrow">↳</span> text / base64 / list：<b>file.read · file.list</b></div>
+        <div class="prov"><span class="arrow">↳</span> 外部应用打开：<b>app.open</b></div>
+      </div>
+      <div class="cap">
+        <div class="capname">media.view</div>
+        <div class="capdesc">放视频 / 看图 / 开文档</div>
+        <div class="prov"><span class="arrow">↳</span> 交给本机播放器 / 查看器：<b>app.open</b></div>
+        <div class="prov" style="color:var(--dim)">依赖：mpv · feh · zathura · libreoffice · yt-dlp</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== ③ 叶子工具 ===== -->
+  <div class="layer">
+    <div class="accentbar" style="background:var(--cyan)"></div>
+    <div class="head">
+      <div class="badge"><span class="num" style="background:var(--cyan)">③</span>叶子工具 · Tool Provider 原语</div>
+      <div class="tagline">「让计算机能做」——Service 之上、按领域组织的可执行叶子</div>
+    </div>
+    <div class="chips">
+      <span class="chip"><b>terminal.exec</b></span>
+      <span class="chip"><b>process.start</b><span class="en">· process.list</span></span>
+      <span class="chip"><b>file.read</b><span class="en">· file.write · file.list</span></span>
+      <span class="chip"><b>app.open</b></span>
+      <span class="chip"><b>web.fetch</b><span class="en">· web.read</span></span>
+      <span class="chip"><b>system.install</b><span class="en">依赖补装</span></span>
+      <span class="chip"><b>system.stats</b></span>
+    </div>
+  </div>
+
+  <!-- ===== ④ 服务层 ===== -->
+  <div class="layer">
+    <div class="accentbar" style="background:var(--blue)"></div>
+    <div class="head">
+      <div class="badge"><span class="num" style="background:var(--blue)">④</span>服务层 · AION System Services</div>
+      <div class="tagline">Cordis Service，统一负责权限检查与资源抽象</div>
+      <div class="headnote">高危命令（terminal.exec）与补装操作都会弹确认门</div>
+    </div>
+    <div class="chips">
+      <span class="chip"><b>process</b><span class="en">进程</span></span>
+      <span class="chip"><b>fs</b><span class="en">文件</span></span>
+      <span class="chip"><b>network</b><span class="en">网络</span></span>
+      <span class="chip"><b>terminal</b><span class="en">终端 / IO</span></span>
+      <span class="chip"><b>sandbox</b><span class="en">沙箱隔离</span></span>
+      <span class="chip"><b>storage</b><span class="en">存储配额</span></span>
+      <span class="chip"><b>device</b><span class="en">设备</span></span>
+      <span class="chip"><b>model</b><span class="en">LLM 模型</span></span>
+      <span class="chip"><b>security</b><span class="en">权限 &amp; Capability 检查</span></span>
+    </div>
+  </div>
+
+  <!-- ===== ⑤ 适配层 ===== -->
+  <div class="layer">
+    <div class="accentbar" style="background:var(--green)"></div>
+    <div class="head">
+      <div class="badge"><span class="num" style="background:var(--green)">⑤</span>适配层 · AION Linux Adapter</div>
+      <div class="tagline">系统调用封装 + 真实沙箱；启动时探测，无特权自动降级</div>
+    </div>
+    <div class="chips">
+      <span class="chip"><b>namespace</b><span class="en">unshare / setns</span></span>
+      <span class="chip"><b>cgroup v2</b><span class="en">memory · cpu · pids</span></span>
+      <span class="chip"><b>seccomp</b><span class="en">BPF 白名单</span></span>
+      <span class="chip"><b>capability</b><span class="en">PR_CAPBSET_DROP</span></span>
+      <span class="chip"><b>mount</b><span class="en">chroot / pivot</span></span>
+      <span class="chip"><b>process</b><span class="en">clone / execve</span></span>
+      <span class="chip"><b>fs · net · device</b></span>
+    </div>
+    <div class="chips" style="margin-top:10px">
+      <span class="chip" style="border-style:dashed;color:var(--muted)">不可写 / 非 root → cgroup 降级 <span class="en">EmulatedCgroup</span>、能力如实标注 <span class="en">✗</span>，进程照常运行</span>
+    </div>
+  </div>
+
+  <!-- ===== ⑥ 内核层 ===== -->
+  <div class="layer">
+    <div class="accentbar" style="background:var(--pink)"></div>
+    <div class="head">
+      <div class="badge"><span class="num" style="background:var(--pink)">⑥</span>内核层 · Linux Kernel</div>
+    </div>
+    <div class="chips">
+      <span class="chip">进程</span>
+      <span class="chip">文件系统</span>
+      <span class="chip">网络</span>
+      <span class="chip">资源控制</span>
+      <span class="chip">隔离</span>
+      <span class="chip">设备</span>
+      <span class="chip">安全 <span class="en">LSM / SELinux</span></span>
+    </div>
+  </div>
+
+  <!-- ===== 调用流程 ===== -->
+  <div class="flow">
+    <div class="flabel">一次请求的完整调用流程</div>
+    <div class="flowrow">
+      <span class="fnode"><b>Agent</b> <span class="en">发起请求</span></span>
+      <span class="farr">→</span>
+      <span class="fnode"><b>Context</b> <span class="en">cordis · 取 Service</span></span>
+      <span class="farr">→</span>
+      <span class="fnode"><b>Capability</b> <span class="en">resolver 解析</span></span>
+      <span class="farr">→</span>
+      <span class="fnode"><b>叶子 Tool</b> <span class="en">ToolRuntime</span></span>
+      <span class="farr">→</span>
+      <span class="fnode"><b>Service</b> <span class="en">权限检查</span></span>
+      <span class="farr">→</span>
+      <span class="fnode"><b>Linux Adapter</b> <span class="en">系统调用 · 沙箱</span></span>
+      <span class="farr">→</span>
+      <span class="fnode"><b>Linux Kernel</b> <span class="en">执行操作</span></span>
+      <span class="farr">→</span>
+      <span class="fnode result"><b>结果</b> <span class="en">事件 / Effect → UI 块</span></span>
+    </div>
+  </div>
+
+</div>
+</body>
+</html>
