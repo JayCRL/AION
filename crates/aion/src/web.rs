@@ -488,6 +488,34 @@ async fn run_agentic_loop(
         new_history.push(ChatMessage::assistant("已展示全部渲染器样例。".to_string()));
         return out;
     }
+    // 开发命令「弹一个百度」：真实抓取百度首页 → 走与 LLM 完全相同的工具链
+    // （run_consented → runtime.execute → result_to_blocks），跳过模型以做确定性验证。
+    if last_user == "弹一个百度" || last_user == "打开百度" || last_user == "baidu demo" {
+        let mut out = empty();
+        let tu = ToolUseBlock {
+            id: CallId::new().as_str().to_string(),
+            name: "web.fetch".into(),
+            input: serde_json::json!({ "url": "https://www.baidu.com" }),
+        };
+        let tc = ToolCall {
+            call_id: CallId::new(),
+            tool: tu.name.clone(),
+            arguments: tu.input.clone(),
+            sandbox: Some(ToolSandboxHint::Default),
+        };
+        let result = run_consented(state, ctx, runtime, sec, session_id, &tc).await;
+        let rj = serde_json::to_value(&result).unwrap_or(serde_json::Value::Null);
+        for b in result_to_blocks(&tu, &rj) {
+            out.blocks.push(b.clone());
+            if let Some(t) = &tx {
+                let _ = t.send(b.to_string());
+            }
+        }
+        new_history.push(ChatMessage::assistant(
+            "已抓取百度首页并原生重排进画布（真实网络请求）。".to_string(),
+        ));
+        return out;
+    }
     let model = match ctx.require::<ModelService>().await {
         Ok(m) => m,
         Err(e) => {
@@ -805,6 +833,46 @@ fn result_to_blocks(tu: &ToolUseBlock, result_json: &serde_json::Value) -> Vec<s
                 "type": "stats",
                 "data": data,
             })]
+        }
+        "web.fetch" => {
+            // 网页 → AION 原生卡片：标题/描述/正文链接用 markdown 渲染器重排，
+            // 链接是绝对 http(s)，前端 md() 会把它们变成可点的外链。
+            let url = data.get("url").and_then(|v| v.as_str()).unwrap_or("");
+            let status = data.get("status").and_then(|v| v.as_u64()).unwrap_or(0);
+            let bytes = data.get("bytes").and_then(|v| v.as_u64()).unwrap_or(0);
+            let title = data.get("title").and_then(|v| v.as_str()).unwrap_or("").trim();
+            let desc = data.get("description").and_then(|v| v.as_str()).unwrap_or("").trim();
+            let links = data
+                .get("links")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let mut md = format!(
+                "# {}\n\n",
+                if title.is_empty() { "（页面无标题）" } else { title }
+            );
+            if !desc.is_empty() {
+                md.push_str(&format!("> {desc}\n\n"));
+            }
+            if !links.is_empty() {
+                md.push_str("**页面链接**\n");
+                for l in links.iter().take(12) {
+                    let text = l.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                    let u = l.get("url").and_then(|v| v.as_str()).unwrap_or("");
+                    if text.is_empty() || u.is_empty() {
+                        continue;
+                    }
+                    md.push_str(&format!("- [{}]({})\n", text, u));
+                }
+            } else {
+                md.push_str("_未能提取到正文链接（页面内容可能靠脚本动态生成）。_\n");
+            }
+            md.push_str(&format!(
+                "\n> ⚡ `web.fetch` · HTTP {status} · {} · {}",
+                url,
+                human_size(bytes)
+            ));
+            vec![serde_json::json!({ "type": "markdown", "source": md })]
         }
         _ => {
             let pretty = serde_json::to_string_pretty(&data).unwrap_or_default();

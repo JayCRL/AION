@@ -12,6 +12,7 @@ pub mod process;
 pub mod risk;
 pub mod system;
 pub mod terminal;
+pub mod web;
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -287,6 +288,7 @@ pub fn populate_builtin_registry(reg: &ToolRegistry) -> CordisResult<()> {
     reg.register(process::ProcessStartTool::new()).map_err(err)?;
     reg.register(terminal::TerminalExecTool::new()).map_err(err)?;
     reg.register(system::SystemStatsTool::new()).map_err(err)?;
+    reg.register(web::WebFetchTool::new()).map_err(err)?;
     // Silence the unused ErrorKind import warning if any; the symbol is used inline.
     let _ = ErrorKind::Internal;
     Ok(())
