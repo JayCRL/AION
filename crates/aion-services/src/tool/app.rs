@@ -101,6 +101,27 @@ fn ensure_display_env(cmd: &mut std::process::Command) {
     }
 }
 
+/// 定位 yt-dlp 二进制：env `AION_YTDLP` → `$HOME/.local/bin/yt-dlp` → PATH 上的 `yt-dlp`。
+///
+/// 与 `moli_bin()`（web.rs）同一先例。为什么不能裸 `Command::new("yt-dlp")`：B 站 wbi 签名
+/// 频繁改版，发行版源里的老版（如 /usr/bin/yt-dlp 2022.04.08）会对 B 站**稳定 412**——解析直链
+/// 每次都失败，app.open 只能回退把原始页面 URL 丢给播放器 → mpv 加载即退。用户级新版独立二进制
+/// 通常装在 `~/.local/bin/yt-dlp`，须优先命中它。
+fn ytdlp_bin() -> String {
+    if let Ok(p) = std::env::var("AION_YTDLP") {
+        if !p.trim().is_empty() {
+            return p.trim().to_string();
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        let cand = format!("{home}/.local/bin/yt-dlp");
+        if std::path::Path::new(&cand).exists() {
+            return cand;
+        }
+    }
+    "yt-dlp".to_string()
+}
+
 /// 用 yt-dlp 把站点页面 URL 解析成可直接播放的媒体直链。
 ///
 /// B 站等视频站的抗爬会**随机 412**：同一 URL 这次被拒、下次就成。故整段最多尝试
@@ -115,7 +136,7 @@ fn resolve_media_url(raw: &str) -> Option<String> {
     const PER_TRY: Duration = Duration::from_secs(10);
 
     for _ in 0..MAX_TRIES {
-        let Ok(mut child) = std::process::Command::new("yt-dlp")
+        let Ok(mut child) = std::process::Command::new(ytdlp_bin())
             // 纯视频流 bv[height<=720]：kiosk 无音频设备——带音轨的流会让 mpv 因初始化音频失败而
         // 直接中止(Errors when loading file)，纯视频流无音轨、不初始化音频，静音照放。
         .args([
