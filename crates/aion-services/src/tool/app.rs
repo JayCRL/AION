@@ -96,6 +96,52 @@ fn ensure_display_env(cmd: &mut std::process::Command) {
     }
 }
 
+/// 用 yt-dlp 把站点页面 URL 解析成可直接播放的媒体直链（≤25s）。
+/// yt-dlp 缺失 / 失败 / 超时 → None，调用方回退原 URL（直链媒体 mpv 仍能直接放）。
+fn resolve_media_url(raw: &str) -> Option<String> {
+    use std::io::Read;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    let Ok(mut child) = std::process::Command::new("yt-dlp")
+        .args([
+            "-g",
+            "--no-warnings",
+            "--no-playlist",
+            "--format",
+            "best[height<=720]/best",
+            raw,
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return None;
+    };
+    let start = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(st)) if st.success() => break,
+            Ok(Some(_)) => return None,
+            Ok(None) => {}
+            Err(_) => return None,
+        }
+        if start.elapsed() >= Duration::from_secs(25) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let mut s = String::new();
+    let mut out = child.stdout.take()?;
+    out.read_to_string(&mut s).ok()?;
+    s.lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty() && (l.starts_with("http://") || l.starts_with("https://")))
+        .map(str::to_string)
+}
+
 fn is_exec(p: &Path) -> bool {
     match std::fs::metadata(p) {
         Ok(m) if m.is_file() => {
@@ -177,8 +223,8 @@ impl Tool for AppOpenTool {
                 "`path` 不能为空",
             );
         }
-        // http(s) 在线媒体 URL：不按扩展名分派，直接走媒体播放器白名单。mpv 集成
-        // yt-dlp 时站点视频（B 站/优酷…）的页面 URL 可直放，否则请先手动解析出直链。
+        // http(s) 在线媒体 URL：不按扩展名分派，直接走媒体播放器白名单，并先经 yt-dlp
+        // 解出可播放直链（站点视频 B 站/优酷…）再交给播放器；解析失败则回退原 URL。
         let is_url = path.starts_with("http://") || path.starts_with("https://");
         let ext = Path::new(&path)
             .extension()
@@ -228,8 +274,14 @@ impl Tool for AppOpenTool {
             );
         };
 
+        // URL 先经 yt-dlp 解直链（站点视频才能放）；失败退回原 URL（纯直链媒体仍可）。
+        let play_arg = if is_url {
+            resolve_media_url(&path).unwrap_or_else(|| path.clone())
+        } else {
+            path.clone()
+        };
         let mut cmd = std::process::Command::new(&bin);
-        cmd.arg(&path);
+        cmd.arg(&play_arg);
         ensure_display_env(&mut cmd);
         match cmd.spawn() {
             Ok(_) => ToolResult::success(json!({
