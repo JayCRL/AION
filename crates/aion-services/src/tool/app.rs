@@ -55,7 +55,19 @@ fn viewer_candidates(ext: &str) -> Vec<&'static str> {
 ///
 /// `pub(crate)`：capability 依赖满足判定（capability.rs `dep_satisfied`）与
 /// `system.install` 安装后复测都复用这一份，保证「探测 / 安装 / 复测」同一套判定。
+///
+/// 返回命中项的**裸名**（薄封装 [`which_bin_path`]）；调用方只要判「在不在」就用这个。
 pub(crate) fn which_bin(names: &[&str]) -> Option<String> {
+    which_bin_path(names).map(|p| {
+        p.file_name()
+            .map(|f| f.to_string_lossy().into_owned())
+            .unwrap_or_else(|| names[0].to_string())
+    })
+}
+
+/// 同 [`which_bin`] 的目录判定，但返回命中文件的**完整路径**——给软件档案扫描
+/// （`scan.rs`）用：既要判「在不在」，又要拿路径去探版本 / 展示。
+pub(crate) fn which_bin_path(names: &[&str]) -> Option<PathBuf> {
     let path_env = std::env::var("PATH").unwrap_or_default();
     let mut dirs: Vec<PathBuf> = path_env
         .split(':')
@@ -72,14 +84,14 @@ pub(crate) fn which_bin(names: &[&str]) -> Option<String> {
         let p = Path::new(name);
         if p.is_absolute() {
             if is_exec(p) {
-                return Some(name.to_string());
+                return Some(p.to_path_buf());
             }
             continue;
         }
         for d in &dirs {
             let cand = d.join(name);
             if is_exec(&cand) {
-                return Some(name.to_string());
+                return Some(cand);
             }
         }
     }

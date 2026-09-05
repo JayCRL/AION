@@ -1,0 +1,18 @@
+# AION — systemd user unit（install.sh 写入 ~/.config/systemd/user/aion.service）
+# 用户级服务：无需 root。启动后开 http://localhost:8080 在网页里配 LLM 供应商即可。
+# 桌面查看能力（file.view 弹本地播放器/看图器）需要 X：默认 DISPLAY=:0；
+# 纯 headless 服务器用不到可自行删掉那两行。
+[Unit]
+Description=AION Agent OS web
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/.config/aion
+ExecStart=%h/.local/bin/aion web --port 8080
+Restart=on-failure
+RestartSec=3
+Environment=DISPLAY=:0
+
+[Install]
+WantedBy=default.target

@@ -325,7 +325,8 @@ fn apt_install(packages: &[String]) -> InstallOutcome {
 }
 
 /// 同步执行外部程序，超时杀掉；返回 (exit 是否 0, stdout+stderr 合并)。
-fn run_capture(program: &str, args: &[&str], secs: u64) -> (bool, String) {
+/// `pub(crate)`：软件档案扫描（`scan.rs`）探版本号复用它。
+pub(crate) fn run_capture(program: &str, args: &[&str], secs: u64) -> (bool, String) {
     use std::io::Read;
     let child = match std::process::Command::new(program)
         .args(args)

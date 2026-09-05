@@ -24,6 +24,7 @@ pub mod network;
 pub mod process;
 pub mod provider;
 pub mod sandbox;
+pub mod scan;
 pub mod security;
 pub mod storage;
 pub mod system;
@@ -33,13 +34,14 @@ pub mod tool;
 use aion_adapter::AdapterKit;
 
 pub use capability::{
-    builtin_capability_deps, capability_deps_satisfied, dep_satisfied, image_mime,
+    builtin_capability_deps, capability_deps_satisfied, dep_path, dep_satisfied, image_mime,
     is_external_ext, is_text_ext, lower_ext, register_builtin_capabilities, viewer_icon,
     CapabilityRegistry, ResolvedProvider,
 };
 pub use cap_store::{CapabilityStore, CAPABILITIES_FILE};
 pub use error::{AionError, AionResult};
 pub use provider::{backend_from_provider, LlmProtocol, LlmProvider, LlmProviderStore};
+pub use scan::{scan_software, SoftwareProbe};
 pub use sandbox::SandboxRequest;
 pub use security::SecurityContext;
 pub use tool::{populate_builtin_registry, Tool, ToolCallScope, ToolRegistry, ToolRuntime};

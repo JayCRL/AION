@@ -462,11 +462,34 @@ fn dep_moli() -> CapabilityDep {
     }
 }
 
+/// 办公套件查看器（file.view 打开 docx/xlsx/pptx…）。此前只出现在 app.open 的
+/// viewer_candidates 白名单里，缺 `CapabilityDep` → 广场扫不到、system.install 装不了。
+/// binaries 与白名单同源（libreoffice/soffice/wps/onlyoffice），apt 优先 libreoffice。
+fn dep_office_viewer() -> CapabilityDep {
+    CapabilityDep {
+        label: "办公套件查看器".into(),
+        binaries: vec![
+            "libreoffice".into(),
+            "soffice".into(),
+            "wps".into(),
+            "onlyoffice-desktopeditors".into(),
+        ],
+        method: InstallMethod::Apt {
+            packages: vec!["libreoffice".into()],
+        },
+    }
+}
+
 fn deps_web_view() -> Vec<CapabilityDep> {
     vec![dep_moli()]
 }
 fn deps_file_view() -> Vec<CapabilityDep> {
-    vec![dep_image_viewer(), dep_doc_viewer(), dep_media_player()]
+    vec![
+        dep_image_viewer(),
+        dep_doc_viewer(),
+        dep_media_player(),
+        dep_office_viewer(),
+    ]
 }
 fn deps_media_view() -> Vec<CapabilityDep> {
     vec![dep_media_player(), dep_ytdlp()]
@@ -496,4 +519,12 @@ pub fn capability_deps_satisfied(cap: &str) -> bool {
 pub fn dep_satisfied(dep: &CapabilityDep) -> bool {
     let names: Vec<&str> = dep.binaries.iter().map(|s| s.as_str()).collect();
     crate::tool::app::which_bin(&names).is_some()
+}
+
+/// 单个依赖命中的**完整路径**（`binaries` 里第一个在 PATH / `~/.local/bin` 探到的）；
+/// 未满足 → None。web `/api/capabilities` 给广场展示「装在哪」用。判定与
+/// [`dep_satisfied`] 同一套（`which_bin_path`）。
+pub fn dep_path(dep: &CapabilityDep) -> Option<String> {
+    let names: Vec<&str> = dep.binaries.iter().map(|s| s.as_str()).collect();
+    crate::tool::app::which_bin_path(&names).map(|p| p.display().to_string())
 }

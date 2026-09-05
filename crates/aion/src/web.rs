@@ -29,8 +29,8 @@ use aion_services::model::{
 };
 use aion_services::security::SecurityContext;
 use aion_services::{
-    backend_from_provider, dep_satisfied, CapabilityStore, LlmProtocol, LlmProvider,
-    LlmProviderStore,
+    backend_from_provider, builtin_capability_deps, capability_deps_satisfied, dep_path,
+    dep_satisfied, scan_software, CapabilityStore, LlmProtocol, LlmProvider, LlmProviderStore,
 };
 
 /// Capability 已覆盖的叶子工具：不再直接暴露给模型（能力内部按 URL/意图解析选择）。
@@ -50,6 +50,10 @@ struct PendingApproval {
     pub session_id: String,
     /// 原始命令串（用于展示 / 历史回填）。
     pub command: String,
+    /// 若本次挂起是「自动补装门」触发（见 `auto_install_gate`）：这里是**触发补装的
+    /// 那个原能力调用**。用户同意补装 → `api_action` 装完依赖后用它续跑原能力，
+    /// 一步到位，不依赖模型二次重发。
+    pub resume: Option<ToolUseBlock>,
 }
 
 /// Web 层共享状态。
@@ -124,6 +128,7 @@ pub async fn run(port: u16) -> anyhow::Result<()> {
         .route("/api/llm/providers/:id", delete(api_llm_delete))
         .route("/api/sessions", get(api_sessions).post(api_new_session))
         .route("/api/capabilities", get(api_capabilities))
+        .route("/api/scan", get(api_scan))
         .route(
             "/api/capabilities/:name/enable",
             post(api_cap_enable),
@@ -135,6 +140,10 @@ pub async fn run(port: u16) -> anyhow::Result<()> {
         .route(
             "/api/capabilities/:name/install",
             post(api_cap_install),
+        )
+        .route(
+            "/api/capabilities/install-all",
+            post(api_capabilities_install_all),
         )
         .layer(CorsLayer::permissive())
         .with_state(state);
@@ -302,6 +311,8 @@ async fn api_capabilities(State(state): State<Arc<AppState>>) -> impl IntoRespon
                         "label": d.label,
                         "binaries": d.binaries,
                         "satisfied": dep_satisfied(d),
+                        // 命中时的完整路径（`which_bin_path`），广场展示「装在哪」。
+                        "path": dep_path(d),
                         "method": d.method,
                     })
                 })
@@ -383,6 +394,89 @@ async fn api_cap_install(
     let result = runtime.execute(&ctx, tc, sec).await;
     let rj = serde_json::to_value(&result).unwrap_or(serde_json::Value::Null);
     Ok(Json(serde_json::json!({ "status": "ok", "result": rj })))
+}
+
+/// 一键补齐全部缺失（开箱即用 · 工作流 B）：遍历内置能力依赖清单，对每个
+/// `capability_deps_satisfied` 为假的能力执行一次 `system.install`。按钮 = 显式同意，
+/// 与 `api_cap_install` 同先例（developer_sec 直接跑，跳过确认门）。
+/// 聚合返回逐依赖状态计数，供前端 toast / 广场刷新。
+async fn api_capabilities_install_all(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let ctx = state.ctx.clone();
+    let runtime = state.tool_runtime.clone();
+    let sec = aion::agents::developer_sec("web-user", &[]);
+    let mut results: Vec<serde_json::Value> = Vec::new();
+    let mut already = 0usize;
+    let mut installed = 0usize;
+    let mut needs_action = 0usize;
+
+    for (cap, deps) in builtin_capability_deps() {
+        if deps.iter().all(|d| dep_satisfied(d)) {
+            results.push(serde_json::json!({
+                "capability": cap,
+                "all_ok": true,
+                "skipped": true,
+            }));
+            continue;
+        }
+        let tc = ToolCall {
+            call_id: CallId::new(),
+            tool: "system.install".into(),
+            arguments: serde_json::json!({ "capability": cap }),
+            sandbox: Some(ToolSandboxHint::Default),
+        };
+        let result = runtime.execute(&ctx, tc, sec.clone()).await;
+        let rj = serde_json::to_value(&result).unwrap_or(serde_json::Value::Null);
+        let data = tool_result_fields(&rj);
+        let all_ok = data.get("all_ok").and_then(|v| v.as_bool()).unwrap_or(false);
+        let dep_items = data
+            .get("deps")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        for it in dep_items {
+            match it.get("status").and_then(|v| v.as_str()).unwrap_or("") {
+                "already" => already += 1,
+                "installed" => installed += 1,
+                _ => needs_action += 1,
+            }
+        }
+        results.push(serde_json::json!({
+            "capability": cap,
+            "all_ok": all_ok,
+            "skipped": false,
+            "data": data,
+        }));
+    }
+
+    Ok(Json(serde_json::json!({
+        "status": "ok",
+        "counts": {
+            "already": already,
+            "installed": installed,
+            "needs_action": needs_action,
+        },
+        "results": results,
+    })))
+}
+
+/// 本机软件档案扫描（开箱即用 · 工作流 A）：以内置能力依赖清单为「已知软件」全集，
+/// 逐项 which（$PATH + ~/.local/bin）+ 尽力取 `--version`。只探测不改系统。
+/// 探测是同步阻塞（最长每项 ~2s），放 `spawn_blocking` 不占 tokio worker。
+async fn api_scan() -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let items = tokio::task::spawn_blocking(scan_software)
+        .await
+        .map_err(|e| {
+            err_json(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("software scan failed: {e}"),
+            )
+        })?
+        .into_iter()
+        .map(|p| serde_json::to_value(&p).unwrap_or(serde_json::Value::Null))
+        .collect::<Vec<_>>();
+    Ok(Json(serde_json::json!({ "software": items })))
 }
 
 // ---------------------------------------------------------------------------
@@ -539,6 +633,7 @@ async fn run_consented(
             tool_call: tc.clone(),
             session_id: session_id.to_string(),
             command,
+            resume: None,
         },
     );
     ToolResult {
@@ -548,6 +643,46 @@ async fn run_consented(
         artifacts: Vec::new(),
         events: vec![block],
     }
+}
+
+/// 自动补装门（开箱即用 · 工作流 B）——在**能力还没被解析/执行前**拦截：
+///
+/// 若模型要调的 Capability 已启用、但本机缺它的软件依赖（`capability_deps_satisfied`
+/// 为假），直接执行叶子会因缺 yt-dlp / moli / 阅读器而失败。此时不往下跑，改发一次
+/// `system.install` 并走 `run_consented` 弹「确认补装依赖」门，并把**触发补装的那个
+/// 原能力调用**挂到挂起项 `resume` 上——用户同意后由 `api_action` 装完依赖再续跑原能力。
+///
+/// 返回 `Some((install_tc, result))` = 已发起补装（调用方应把 install_tc 记入 tool_calls、
+/// 若 result Pending 则停本轮等用户决定）；返回 `None` = 无需补装，按原路径执行。
+async fn auto_install_gate(
+    state: &AppState,
+    ctx: &cordis::Context,
+    runtime: &aion_services::tool::ToolRuntime,
+    sec: &SecurityContext,
+    session_id: &str,
+    tu: &ToolUseBlock,
+) -> Option<(ToolCall, ToolResult)> {
+    if !state.capabilities.has(&tu.name)
+        || !state.cap_store.is_enabled(&tu.name)
+        || capability_deps_satisfied(&tu.name)
+    {
+        return None;
+    }
+    let tc_install = ToolCall {
+        call_id: CallId::new(),
+        tool: "system.install".into(),
+        arguments: serde_json::json!({ "capability": tu.name }),
+        sandbox: Some(ToolSandboxHint::Default),
+    };
+    let result = run_consented(state, ctx, runtime, sec, session_id, &tc_install).await;
+    // system.install 必 High → Pending：把原能力挂到刚登记的挂起项上，等用户同意后续跑。
+    if let ResultStatus::Pending { request_id, .. } = &result.status {
+        let mut pend = state.pending.lock().await;
+        if let Some(ap) = pend.get_mut(request_id) {
+            ap.resume = Some(tu.clone());
+        }
+    }
+    Some((tc_install, result))
 }
 
 /// 一次有界「续答」循环的结果。
@@ -582,11 +717,41 @@ fn assistant_system_with_tools(
         }
         list.push_str(&format!("- {}：{}\n", d.name, d.description));
     }
+    // 「开箱即用」：已启用能力里若有本机缺依赖的，告诉模型先 system.install 补装再调用
+    // （装哪个能力由编译期清单决定，装完立即能跑）。全齐则不加这段。
+    let mut missing = String::new();
+    for c in caps.list() {
+        if !store.is_enabled(&c.name) {
+            continue;
+        }
+        let unmet: Vec<&str> = c
+            .deps
+            .iter()
+            .filter(|d| !dep_satisfied(d))
+            .map(|d| d.label.as_str())
+            .collect();
+        if !unmet.is_empty() {
+            if !missing.is_empty() {
+                missing.push_str("、");
+            }
+            missing.push_str(&format!("{}(缺 {})", c.name, unmet.join("/")));
+        }
+    }
+    let deps_hint = if missing.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n\
+             # 本机依赖缺省\n\
+             下列已启用能力在本机缺软件依赖，直接调用会失败——先调 `system.install` 补装\
+             （capability=能力名，需用户确认后自动装并继续）：{missing}。"
+        )
+    };
     format!(
         "{}\n\n# 可用工具 / 能力\n\
          本次对话我已把工具以原生 `tools` 形式提供；需要查询/修改本机/浏览网页时请直接发起工具调用，\
          不要臆造输出。\n\
-         可用项：\n{list}\n\
+         可用项：\n{list}{deps_hint}\n\
          # 回退\n\
          若拿不到 `tools`（纯文本模式），需要执行命令时仍可用 ```run 代码块发出，AION 会自动执行并回喂输出。",
         aion::agents::assistant::ASSISTANT_SYSTEM
@@ -750,6 +915,23 @@ async fn run_agentic_loop(
             name: "web.view".into(),
             input: serde_json::json!({ "url": pop_url }),
         };
+        // 自动补装门：与 run_agentic_loop 同规则——缺依赖先弹「确认补装依赖」，
+        // 同意后由 api_action 装完依赖并续跑原能力，一步到位。
+        if let Some((_tc_install, gate_r)) =
+            auto_install_gate(state, ctx, runtime, sec, session_id, &cap_tu).await
+        {
+            if result_is_pending(&gate_r) {
+                out.paused = true;
+                for b in &gate_r.events {
+                    let bv = block_value(b);
+                    out.blocks.push(bv.clone());
+                    if let Some(t) = &tx {
+                        let _ = t.send(bv.to_string());
+                    }
+                }
+                return out;
+            }
+        }
         let tu = resolve_leaf_tu(&state.capabilities, &state.cap_store, &cap_tu);
         let tc = ToolCall {
             call_id: CallId::new(),
@@ -777,6 +959,23 @@ async fn run_agentic_loop(
             name: "file.view".into(),
             input: serde_json::json!({ "path": fpath }),
         };
+        // 自动补装门：与 run_agentic_loop 同规则——缺依赖先弹「确认补装依赖」，
+        // 同意后由 api_action 装完依赖并续跑原能力，一步到位。
+        if let Some((_tc_install, gate_r)) =
+            auto_install_gate(state, ctx, runtime, sec, session_id, &cap_tu).await
+        {
+            if result_is_pending(&gate_r) {
+                out.paused = true;
+                for b in &gate_r.events {
+                    let bv = block_value(b);
+                    out.blocks.push(bv.clone());
+                    if let Some(t) = &tx {
+                        let _ = t.send(bv.to_string());
+                    }
+                }
+                return out;
+            }
+        }
         let tu = resolve_leaf_tu(&state.capabilities, &state.cap_store, &cap_tu);
         let tc = ToolCall {
             call_id: CallId::new(),
@@ -803,6 +1002,23 @@ async fn run_agentic_loop(
             name: "media.view".into(),
             input: serde_json::json!({ "url": murl }),
         };
+        // 自动补装门：与 run_agentic_loop 同规则——缺依赖先弹「确认补装依赖」，
+        // 同意后由 api_action 装完依赖并续跑原能力，一步到位。
+        if let Some((_tc_install, gate_r)) =
+            auto_install_gate(state, ctx, runtime, sec, session_id, &cap_tu).await
+        {
+            if result_is_pending(&gate_r) {
+                out.paused = true;
+                for b in &gate_r.events {
+                    let bv = block_value(b);
+                    out.blocks.push(bv.clone());
+                    if let Some(t) = &tx {
+                        let _ = t.send(bv.to_string());
+                    }
+                }
+                return out;
+            }
+        }
         let tu = resolve_leaf_tu(&state.capabilities, &state.cap_store, &cap_tu);
         let tc = ToolCall {
             call_id: CallId::new(),
@@ -927,6 +1143,29 @@ async fn run_agentic_loop(
         let mut results: Vec<ToolResultBlock> = Vec::new();
         let mut paused = false;
         for tu in tuses {
+            // 自动补装门：能力缺本机软件依赖 → 先弹「确认补装依赖」，不直接跑叶子
+            // （会因缺 yt-dlp / moli / 阅读器而失败）。同意后装完续跑原能力。
+            if let Some((tc_install, gate_r)) =
+                auto_install_gate(state, ctx, runtime, sec, session_id, &tu).await
+            {
+                out.tool_calls.push(serde_json::json!({
+                    "call_id": tc_install.call_id.as_str(),
+                    "tool": tc_install.tool.clone(),
+                    "arguments": tc_install.arguments.clone(),
+                }));
+                if result_is_pending(&gate_r) {
+                    paused = true;
+                    for b in &gate_r.events {
+                        let bv = block_value(b);
+                        out.blocks.push(bv.clone());
+                        if let Some(t) = &tx {
+                            let _ = t.send(bv.to_string());
+                        }
+                    }
+                    break;
+                }
+                // 极少数情况 install 低风险直接执行完：继续走下方正常 resolve 分支。
+            }
             // 能力（web.view 等）→ 叶子 Provider；普通叶子原样。schema 校验/执行/
             // result_to_blocks 都只看叶子，能力只在这里解引用一次。
             let leaf = resolve_leaf_tu(&state.capabilities, &state.cap_store, &tu);
@@ -1545,6 +1784,49 @@ async fn api_action(
         history.push(ChatMessage::user(format!(
             "用户已同意执行 `{display}`，输出：\n{output_text}"
         )));
+
+        // 自动补装门触发（resume=Some）：装完依赖后**直接续跑原能力**——用户已同意
+        // 该动作的前提（补装），能力现在依赖齐了，无需模型二次重发。
+        let install_ok = tool_result_fields(&result_json)
+            .get("all_ok")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if install_ok {
+            if let Some(orig_tu) = approval.resume {
+                let leaf = resolve_leaf_tu(&state.capabilities, &state.cap_store, &orig_tu);
+                let tc_resume = ToolCall {
+                    call_id: CallId::new(),
+                    tool: leaf.name.clone(),
+                    arguments: leaf.input.clone(),
+                    sandbox: Some(ToolSandboxHint::Default),
+                };
+                tool_calls.push(serde_json::json!({
+                    "call_id": tc_resume.call_id.as_str(),
+                    "tool": tc_resume.tool.clone(),
+                    "arguments": tc_resume.arguments.clone(),
+                }));
+                let r2 = runtime.execute(&ctx, tc_resume.clone(), sec.clone()).await;
+                let rj2 = serde_json::to_value(&r2).unwrap_or(serde_json::Value::Null);
+                tool_results.push(rj2.clone());
+                if result_is_pending(&r2) {
+                    // 极不可能（能力解析到的叶子通常非 High）：转成新确认块交给同一机制。
+                    blocks.extend(r2.events.iter().map(block_value));
+                } else {
+                    blocks.extend(result_to_blocks(&leaf, &rj2));
+                    let out2 = summarize_tool_data(&rj2);
+                    history.push(ChatMessage::user(format!(
+                        "依赖已补装，原能力 `{}` 已继续执行，输出：\n{out2}",
+                        orig_tu.name
+                    )));
+                }
+            }
+        } else {
+            // 补装未完全成功（如 apt 需 NOPASSWD → needs_sudo）：提示手动补齐，不续跑。
+            blocks.push(serde_json::json!({
+                "type": "text",
+                "markdown": "依赖未全部就绪（系统包可能需要 root 手动安装）。装好后重新发起即可。",
+            }));
+        }
 
         // 同意后让 agent 接着用原生工具循环续答（可能继续调工具，也可能收尾）
         let cont = run_agentic_loop(

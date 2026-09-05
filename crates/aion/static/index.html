@@ -264,6 +264,21 @@ body.lite .input-box{background:rgba(255,255,255,.09);border-color:rgba(255,255,
 .cap-card .dep .hint{font-size:10px;color:var(--txt2);opacity:.8}
 .cap-card .ops{display:flex;gap:6px;margin-top:11px;flex-wrap:wrap;align-items:center}
 .cap-card .ops .mini-btn:disabled{opacity:.5;cursor:default}
+/* 能力广场工具栏：缺省计数 + 「一键补齐」「本机软件档案」 */
+.cap-toolbar{display:flex;align-items:center;justify-content:space-between;gap:10px;margin:0 0 10px;flex-wrap:wrap}
+.cap-toolbar .cap-miss{font-size:12px;color:var(--txt2)}
+.cap-toolbar .cap-miss.ok{color:var(--ok)}
+.cap-toolbar .cap-miss b{color:var(--warn)}
+.cap-toolbar .ops{display:flex;gap:6px;align-items:center}
+/* 本机软件档案面板（复用 .dep 绿✓/红✗ 语义） */
+.scan-head{font-size:12px;font-weight:600;margin:0 0 6px;color:var(--txt)}
+.scan-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:5px 12px;max-height:300px;overflow:auto;border:1px solid var(--glass-brd);border-radius:10px;padding:10px 12px;background:rgba(124,110,228,.03);margin-bottom:10px}
+.scan-grid .s-item{display:flex;align-items:center;gap:7px;font-size:11px;color:var(--txt2);min-width:0}
+.scan-grid .s-item .dk{font-size:11px;flex:none}
+.scan-grid .s-item .dk.ok{color:var(--ok)}
+.scan-grid .s-item .dk.no{color:var(--err)}
+.scan-grid .s-item .sn{font-family:monospace;color:var(--txt);flex:none}
+.scan-grid .s-item .sv{font-size:10px;color:var(--txt2);opacity:.8;margin-left:auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:140px}
 /* ── provider manager (cc-switch style) ── */
 .prov-row{border:1px solid var(--glass-brd);border-radius:10px;padding:12px 14px;margin-bottom:10px;transition:border-color .2s,background .2s}
 .prov-row.active{border-color:var(--acc);background:rgba(124,110,228,.08)}
@@ -281,6 +296,11 @@ body.lite .input-box{background:rgba(255,255,255,.09);border-color:rgba(255,255,
 .mini-btn.danger:hover{border-color:var(--err);color:var(--err)}
 .model-chip{position:fixed;bottom:26px;left:72px;z-index:20;font-size:11px;color:var(--txt2);display:flex;align-items:center;gap:6px}
 .model-chip .live{width:6px;height:6px;border-radius:50%;background:var(--ok);box-shadow:0 0 6px var(--ok)}
+/* 首次运行 LLM 向导横幅：landing 态 + 未配真实模型时显示，进 chat 隐藏 */
+.llm-banner{position:fixed;left:50%;transform:translateX(-50%);top:76%;z-index:11;display:flex;align-items:center;gap:10px;background:rgba(251,191,36,.08);border:1px solid rgba(251,191,36,.4);color:var(--warn);font-size:12px;padding:8px 8px 8px 14px;border-radius:24px;box-shadow:0 4px 18px rgba(0,0,0,.18);max-width:min(600px,92vw)}
+.llm-banner .mini-btn{flex:none;background:var(--warn);border-color:var(--warn);color:#000;font-weight:600}
+.llm-banner .mini-btn:hover{opacity:.85}
+.state-chat .llm-banner{display:none!important}
 
 /* ── toast ── */
 .toast{position:fixed;bottom:20px;right:20px;background:var(--bg3);border:1px solid var(--glass-brd);color:var(--txt);padding:10px 18px;border-radius:var(--r);font-size:13px;z-index:200;animation:slideUp .3s}
@@ -373,6 +393,12 @@ body.lite .input-box{background:rgba(255,255,255,.09);border-color:rgba(255,255,
 <div class="gear-btn" onclick="openSettings()" title="Settings">⚙️</div>
 <div class="model-chip" id="modelChip" style="display:none"><span class="live"></span><span id="modelName"></span></div>
 
+<!-- 首次运行向导：未配真实 LLM（仍是 Echo 后端）时 landing 提示去配置 -->
+<div class="llm-banner" id="llmBanner" style="display:none">
+  <span>尚未配置真实 LLM，当前回答由内置 Echo 后端生成</span>
+  <button class="mini-btn primary" onclick="gotoLLMSettings()">去配置</button>
+</div>
+
 <!-- settings modal -->
 <div class="modal-ov" id="settingsModal">
   <div class="modal">
@@ -410,6 +436,17 @@ body.lite .input-box{background:rgba(255,255,255,.09);border-color:rgba(255,255,
     </div>
     <div class="tab-content" id="tab-caps">
       <p style="color:var(--txt2);font-size:11px;margin:0 0 10px">能力广场：开关决定该能力是否对 Agent 开放；依赖 ✗ 时可点「安装」补装所需软件（用户级二进制免 root，apt 包需 sudo）。</p>
+      <div class="cap-toolbar">
+        <div class="cap-miss" id="capsMissing"></div>
+        <div class="ops">
+          <button class="mini-btn" id="scanBtn" onclick="toggleScanPanel()">本机软件档案</button>
+          <button class="mini-btn primary" id="installAllBtn" onclick="installAllMissing(this)">一键补齐全部缺失</button>
+        </div>
+      </div>
+      <div id="scanPanel" style="display:none">
+        <p class="scan-head">本机软件档案 <span style="font-weight:400;color:var(--txt2)">（以内置能力清单为全集；只探测不改装）</span></p>
+        <div class="scan-grid" id="scanList"><p style="color:var(--txt2);font-size:12px">点「本机软件档案」扫描本机…</p></div>
+      </div>
       <div id="capsList">Loading...</div>
     </div>
     <div class="tab-content" id="tab-tools">
@@ -503,6 +540,15 @@ function updateModelChip(llm){
   }else{
     chip.style.display='none';
   }
+  // 首次运行向导：仍 Echo 后端 → landing 弹「去配置 LLM」横幅（进 chat 由 CSS 隐藏）。
+  let bn=document.getElementById('llmBanner');
+  if(bn)bn.style.display=(llm&&llm.name)?'none':'flex';
+}
+// 「去配置」：开设置抽屉并切到 LLM tab（第一个 tab）。
+function gotoLLMSettings(){
+  openSettings();
+  var t=document.querySelector('.tab-bar .tab');
+  if(t)switchTab('llm',t);
 }
 
 function showProvForm(){
@@ -636,10 +682,32 @@ async function loadMarketplace(){
   let el=document.getElementById('capsList');
   try{
     let d=await fetch('/api/capabilities').then(function(r){return r.json()});
+    updateCapsSummary(d.capabilities||[]);
     renderMarketplace(d.capabilities||[]);
   }catch(e){
     if(el)el.innerHTML='<p style="color:var(--err);font-size:13px">加载广场失败: '+esc(e.message)+'</p>';
   }
+}
+
+// 广场工具栏缺省计数：统计各能力未满足的依赖项数，驱动「一键补齐全部缺失」按钮可用态。
+function updateCapsSummary(caps){
+  let miss=0, missCaps=0;
+  (caps||[]).forEach(function(c){
+    let n=(c.deps||[]).filter(function(x){return !x.satisfied}).length;
+    if(n){miss+=n;missCaps++;}
+  });
+  let el=document.getElementById('capsMissing');
+  let btn=document.getElementById('installAllBtn');
+  if(el){
+    if(miss===0){
+      el.innerHTML='本机软件依赖已全部就绪 ✓';
+      el.className='cap-miss ok';
+    }else{
+      el.innerHTML='本机软件缺 <b>'+miss+'</b> 项依赖（'+missCaps+' 个能力）';
+      el.className='cap-miss';
+    }
+  }
+  if(btn)btn.disabled=miss===0;
 }
 
 // 依赖安装方式的展示文案（按 method JSON 的 kind）。
@@ -720,6 +788,62 @@ async function installCap(name,btn){
   }catch(e){showToast('❌ 安装失败：'+e.message,'error')}
   if(btn){btn.disabled=false;btn.textContent='安装'}
   loadMarketplace();
+}
+
+// 一键补齐全部缺失：POST /api/capabilities/install-all（服务端逐能力跑 system.install，
+// 按钮 = 显式同意，跳过确认门）。toast 汇总后刷新广场。
+async function installAllMissing(btn){
+  if(btn){btn.disabled=true;btn.textContent='补齐中…'}
+  try{
+    let r=await fetch('/api/capabilities/install-all',{method:'POST'});
+    let d=await r.json();
+    if(!r.ok)throw new Error('HTTP '+r.status);
+    let c=d.counts||{};
+    let parts=[];
+    if(c.installed)parts.push('新装 '+c.installed+' 项');
+    if(c.already)parts.push('已就绪 '+c.already);
+    if(c.needs_action)parts.push('需手动处理 '+c.needs_action);
+    let allOk=!c.needs_action;
+    showToast((allOk?'✅ 一键补齐完成：':'⚠️ 部分需手动处理：')+(parts.join('，')||'无需安装'),allOk?'':'error');
+  }catch(e){showToast('❌ 一键补齐失败：'+e.message,'error')}
+  if(btn){btn.disabled=false;btn.textContent='一键补齐全部缺失'}
+  loadMarketplace();
+}
+
+// 本机软件档案面板：toggle 显隐 + 懒加载 /api/scan（版本探测可能慢一两秒）。
+let scanLoaded=false;
+async function toggleScanPanel(){
+  let p=document.getElementById('scanPanel');
+  let btn=document.getElementById('scanBtn');
+  if(!p)return;
+  if(p.style.display!=='none'){p.style.display='none';if(btn)btn.classList.remove('primary');return}
+  p.style.display='block';
+  if(btn)btn.classList.add('primary');
+  if(!scanLoaded){scanLoaded=true;await loadScan()}
+}
+async function loadScan(){
+  let el=document.getElementById('scanList');
+  if(el)el.innerHTML='<p style="color:var(--txt2);font-size:12px">扫描中…</p>';
+  try{
+    let d=await fetch('/api/scan').then(function(r){return r.json()});
+    renderScan(d.software||[]);
+  }catch(e){
+    if(el)el.innerHTML='<p style="color:var(--err);font-size:12px">扫描失败：'+esc(e.message)+'</p>';
+  }
+}
+function renderScan(items){
+  let el=document.getElementById('scanList');
+  if(!el)return;
+  if(!items.length){el.innerHTML='<p style="color:var(--txt2);font-size:12px">无已知软件项</p>';return}
+  let html=items.map(function(x){
+    let p=x.path||'';
+    let v=x.version||'';
+    return '<div class="s-item"><span class="dk '+(x.satisfied?'ok':'no')+'">'+(x.satisfied?'✓':'✗')+'</span>'
+      +'<span class="sn">'+esc(x.name)+'</span>'
+      +'<span style="opacity:.75">'+esc(x.label||'')+'</span>'
+      +'<span class="sv" title="'+esc(p)+'">'+esc(v||'')+'</span></div>';
+  }).join('');
+  el.innerHTML=html;
 }
 
 function renderServices(svcs){
