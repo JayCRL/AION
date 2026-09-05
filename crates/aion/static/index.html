@@ -141,6 +141,32 @@ body.lite .input-box{background:rgba(255,255,255,.09);border-color:rgba(255,255,
 .blk-wp .foot .fl a:hover{text-decoration:underline}
 .blk-wp .foot .fl i.sp{width:1px;height:10px;background:var(--glass-brd);flex:none}
 .blk-wp .foot .mt{margin-left:auto;font-family:monospace}
+/* —— 正文结构卡片（page 块，Moli DOM 结构 → 原生排版）—— */
+.blk-pg{background:var(--bg2);border:1px solid var(--glass-brd);border-radius:14px;overflow:hidden;margin:8px 0}
+.blk-pg .top{display:flex;align-items:center;gap:8px 14px;padding:9px 16px;border-bottom:1px solid var(--glass-brd);flex-wrap:wrap;font-size:12px}
+.blk-pg .top .nav{display:flex;align-items:center;gap:0;flex-wrap:wrap;min-width:0}
+.blk-pg .top .nav a{color:var(--txt2);text-decoration:none;padding:0 9px;white-space:nowrap}
+.blk-pg .top .nav a:hover{color:var(--fg);text-decoration:underline}
+.blk-pg .top .nav i.sp{width:1px;height:11px;background:var(--glass-brd);flex:none}
+.blk-pg .pg-fav{width:20px;height:20px;border-radius:6px;color:#fff;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;flex:none}
+.blk-pg .pg-meta{margin-left:auto;font-family:monospace;color:var(--txt2);font-size:11px}
+.blk-pg .pg-head{padding:14px 18px 6px}
+.blk-pg .pg-tt{font-size:21px;font-weight:700;letter-spacing:.2px;line-height:1.3}
+.blk-pg .pg-url{font-size:12px;color:var(--txt2);text-decoration:none}
+.blk-pg .pg-url:hover{text-decoration:underline;color:var(--ac,#1E6FFF)}
+.blk-pg .pg-body{padding:6px 18px 14px;max-height:52vh;overflow-y:auto;display:flex;flex-direction:column;gap:8px}
+.blk-pg .pg-body::-webkit-scrollbar{width:6px}
+.blk-pg .pg-body::-webkit-scrollbar-thumb{background:var(--glass-brd);border-radius:3px}
+.blk-pg .pg-h1{font-size:26px;font-weight:700;margin:6px 0 2px;line-height:1.35}
+.blk-pg .pg-h2{display:flex;align-items:center;gap:8px;font-size:18px;font-weight:700;margin:12px 0 2px;line-height:1.4}
+.blk-pg .pg-h2>span{width:4px;height:16px;border-radius:2px;flex:none}
+.blk-pg .pg-h3{font-size:15px;font-weight:600;margin:10px 0 0;color:var(--fg);line-height:1.4}
+.blk-pg .pg-p{margin:2px 0;font-size:14px;line-height:1.75;color:var(--txt1);white-space:pre-wrap;word-break:break-word}
+.blk-pg .pg-li{margin:2px 0;padding-left:22px;display:flex;flex-direction:column;gap:3px}
+.blk-pg .pg-li li{font-size:14px;line-height:1.6;color:var(--txt1)}
+.blk-pg .pg-q{margin:4px 0;padding:8px 14px;border-left:3px solid var(--ac,#1E6FFF);background:var(--glass);border-radius:0 8px 8px 0;font-size:14px;line-height:1.7;color:var(--txt2);font-style:italic}
+.blk-pg .pg-img{display:flex;justify-content:center;margin:6px 0}
+.blk-pg .pg-img img{max-width:100%;max-height:320px;border-radius:10px;object-fit:contain;border:1px solid var(--glass-brd)}
 .blk-img{margin:8px 0}
 .blk-img img{max-width:100%;max-height:420px;object-fit:contain;border-radius:12px;border:1px solid var(--glass-brd);display:block;background:#000}
 .blk-img .cap{font-size:11px;color:var(--txt2);margin-top:6px;text-align:center}
@@ -611,7 +637,7 @@ function onSSE(ev){
       appendChip('🔧 '+(ev.tool||'tool')+(ev.command?' → $ '+ev.command:''));
       break;
     case'terminal':case'confirmation':case'table':case'file':case'image':
-    case'chart':case'markdown':case'stats':case'process':case'rich':case'webpage':
+    case'chart':case'markdown':case'stats':case'process':case'rich':case'webpage':case'page':
       removeTyping();openBubble=null;openAcc='';
       appendBlock(ev);
       break;
@@ -697,6 +723,7 @@ function renderBlock(b){
     case'stats':return renderStats(b);
     case'process':return renderProcess(b);
     case'webpage':return renderWebpage(b);
+    case'page':return renderPage(b);
     default:return'';
   }
 }
@@ -736,6 +763,50 @@ function renderWebpage(b){
       (b.meta?'<span class="mt">'+esc(b.meta)+'</span>':'')+'</div>';
   }
   return'<div class="blk-wp">'+top+hero+sr+footRow+'</div>';
+}
+
+// —— 正文结构卡片（page 块）—— Moli 页内抽出的 DOM 结构 → 原生排版 ——
+// header 行（site 徽 + 标题 + 链接 + meta）、标题/段落/列表/图/引用逐块排；
+// host 派生强调色 accent（CSS 接受 hsl()），全部转义防注入。
+function pgLinkA(o){
+  if(!o||!o.href||!/^https?:\/\//i.test(o.href))return'';
+  return'<a href="'+escA(o.href)+'" target="_blank" rel="noopener">'+esc(o.text||o.href)+'</a>';
+}
+function renderPage(b){
+  let accent=/^hsl\(/.test(b.accent||'')?(b.accent):'hsl(214,85%,56%)';
+  let blocks=Array.isArray(b.blocks)?b.blocks:[];
+  let nav=((b.nav||[]).map(pgLinkA).filter(Boolean)).slice(0,6)
+    .join('<i class="sp"></i>');
+  let html='';
+  for(const bl of blocks){
+    if(!bl||typeof bl!=='object')continue;
+    if(typeof bl.h==='number'&&bl.t!==undefined){
+      let lv=Math.min(3,Math.max(1,Math.floor(bl.h||0)||1));
+      if(lv===1)html+='<div class="pg-h1">'+esc(bl.t)+'</div>';
+      else if(lv===2)html+='<div class="pg-h2"><span style="background:'+accent+'"></span>'+esc(bl.t)+'</div>';
+      else html+='<div class="pg-h3">'+esc(bl.t)+'</div>';
+    }else if(bl.p!==undefined){
+      html+='<p class="pg-p">'+esc(bl.p)+'</p>';
+    }else if(Array.isArray(bl.list)){
+      let li=bl.list.map(x=>'<li>'+esc(x)+'</li>').join('');
+      html+='<'+((bl.ordered)?'ol':'ul')+' class="pg-li">'+li+'</'+((bl.ordered)?'ol':'ul')+'>';
+    }else if(bl.quote!==undefined){
+      html+='<blockquote class="pg-q">'+esc(bl.quote)+'</blockquote>';
+    }else if(bl.img&&/^https?:\/\//i.test(bl.img)){
+      html+='<div class="pg-img"><img loading="lazy" src="'+escA(bl.img)+'" alt="'+escA(bl.alt||'')+'" onerror="this.closest(\'.pg-img\').remove()"></div>';
+    }
+  }
+  if(!html)html='<p class="pg-p">（Moli 未抽到正文结构）</p>';
+  let title=esc(b.title||b.host||'');
+  let urlLine=(b.url&&/^https?:\/\//i.test(b.url))
+    ?'<a class="pg-url" href="'+escA(b.url)+'" target="_blank" rel="noopener">'+esc(b.host||b.url)+'</a>':'';
+  let top='<div class="top">'
+    +(b.host?'<span class="pg-fav" style="background:'+accent+'">'+esc((b.host[0]||'?').toUpperCase())+'</span>':'')
+    +(nav?'<div class="nav">'+nav+'</div>':'')
+    +(b.meta?'<span class="mt pg-meta">'+esc(b.meta)+'</span>':'')+'</div>';
+  let head='<div class="pg-head"><div class="pg-tt">'+title+'</div>'+urlLine+'</div>';
+  return'<div class="blk-pg" style="--ac:'+accent+'">'+top+head+
+    '<div class="pg-body">'+html+'</div></div>';
 }
 function renderStats(b){
   let s=b.data||b,html='<div class="blk-stats">';

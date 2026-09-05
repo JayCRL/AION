@@ -501,7 +501,11 @@ async fn run_agentic_loop(
                 "web.read"
             }
             .into(),
-            input: serde_json::json!({ "url": pop_url }),
+            // 非百度站走 structure 模式：取 DOM 结构 → 原生 page 卡（比 markdown 原文更好看）。
+            input: serde_json::json!({
+                "url": pop_url,
+                "structure": !pop_url.contains("baidu.com"),
+            }),
         };
         let tc = ToolCall {
             call_id: CallId::new(),
@@ -875,7 +879,30 @@ fn result_to_blocks(tu: &ToolUseBlock, result_json: &serde_json::Value) -> Vec<s
             })]
         }
         "web.read" => {
-            // Moli 无头引擎读回来的正文（跑完 JS 的真实内容）→ markdown 块。
+            // structure 模式：Moli 页内抽取出的 DOM 结构 → 原生 page 卡。
+            if let Some(blocks) = data.get("blocks").and_then(|b| b.as_array()) {
+                if !blocks.is_empty() {
+                    let host = data.get("host").and_then(|v| v.as_str()).unwrap_or("");
+                    let title = data.get("title").and_then(|v| v.as_str()).unwrap_or("");
+                    // host 派生强调色（HSL 稳定散列）——每个站一个品牌色，别全用蓝。
+                    let mut hue = 0u32;
+                    for b in host.bytes().chain(std::iter::once(7)) {
+                        hue = hue.wrapping_mul(31).wrapping_add(b as u32);
+                    }
+                    let accent = format!("hsl({},62%,46%)", hue % 360);
+                    return vec![serde_json::json!({
+                        "type": "page",
+                        "url": data.get("url").and_then(|v| v.as_str()).unwrap_or(""),
+                        "title": if title.is_empty() { host } else { title },
+                        "host": host,
+                        "accent": accent,
+                        "nav": data.get("nav").cloned().unwrap_or(serde_json::json!([])),
+                        "blocks": blocks,
+                        "meta": "`Moli 结构渲染`",
+                    })];
+                }
+            }
+            // 普通 markdown 模式：Moli 无头引擎读回来的正文（跑完 JS 的真实内容）→ markdown 块。
             let url = data.get("url").and_then(|v| v.as_str()).unwrap_or("");
             let content = data.get("content").and_then(|v| v.as_str()).unwrap_or("");
             let empty = data.get("empty").and_then(|v| v.as_bool()).unwrap_or(false);

@@ -29,6 +29,35 @@ const MAX_LINKS: usize = 24;
 /// 浏览器 UA，部分站点没 UA 会拒。
 const UA: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36 AION/0.1";
 
+/// `web.read` structure 模式用的抽取脚本：**在页面内跑（Moli 已执行 JS）**，
+/// 用原生 DOM API 把「导航 + 按文档序的正文结构（标题/段落/列表/图/引用）」取成
+/// 干净 JSON，供 AION 原生排版成网页卡片——不是整页 markdown 原文搬运。
+const STRUCT_JS: &str = r#"(() => {
+  const txt = el => (el ? (el.innerText || el.textContent || '') : '').replace(/\s+/g, ' ').trim();
+  const host = (location.hostname || '').replace(/^www\./, '');
+  const nav = []; const seen = {};
+  const navEl = document.querySelector('nav, header');
+  if (navEl) for (const a of navEl.querySelectorAll('a[href]')) {
+    const t = txt(a), h = a.href;
+    if (t && h && h.startsWith('http') && !seen[h] && nav.length < 8) { seen[h] = 1; nav.push({ text: t.slice(0, 40), href: h }); }
+  }
+  const root = document.querySelector('main, article') || document.body;
+  const blocks = [];
+  const walk = node => {
+    if (!node || node.nodeType !== 1) return;
+    const tag = node.tagName.toLowerCase();
+    if (tag === 'script' || tag === 'style' || tag === 'noscript' || tag === 'nav' || tag === 'footer' || tag === 'form' || tag === 'aside' || tag === 'header') return;
+    if (/^h[1-6]$/.test(tag)) { const t = txt(node); if (t) { const L = blocks[blocks.length - 1]; if (!(L && L.h === t)) blocks.push({ h: +tag[1], t: t.slice(0, 200) }); } return; }
+    if (tag === 'p') { const t = txt(node); if (t) blocks.push({ p: t.slice(0, 700) }); return; }
+    if (tag === 'img') { const s = node.currentSrc || node.src || '', al = (node.alt || '').trim(); if (s && s.startsWith('http') && !/logo|icon/i.test(al)) blocks.push({ img: s, alt: al.slice(0, 140) }); return; }
+    if (tag === 'ul' || tag === 'ol') { const items = [...node.querySelectorAll(':scope > li')].map(li => txt(li)).filter(Boolean).map(s => s.slice(0, 220)); if (items.length) blocks.push({ list: items.slice(0, 10), ordered: tag === 'ol' }); return; }
+    if (tag === 'blockquote') { const t = txt(node); if (t) blocks.push({ quote: t.slice(0, 400) }); return; }
+    for (const c of node.children) walk(c);
+  };
+  walk(root);
+  return { url: location.href, title: document.title, host, nav, blocks };
+})()"#;
+
 pub struct WebFetchTool {
     def: ToolDefinition,
 }
@@ -110,8 +139,9 @@ impl WebReadTool {
             def: ToolDefinition {
                 name: "web.read".into(),
                 description: concat!(
-                    "用 Moli 无头浏览器引擎读取网页（真实执行页面 JavaScript 并等其加载完），",
-                    "返回渲染成 Markdown 的正文。适合 JS 渲染的 SPA/动态站、或普通抓取拿到空壳的页面。",
+                    "用 Moli 无头浏览器引擎读取网页（真实执行页面 JavaScript 并等其加载完）。",
+                    "默认返回渲染成 Markdown 的正文（适合 JS 渲染的 SPA/动态站）；",
+                    "structure=true 时改为返回 DOM 结构 JSON（title/host/nav/blocks），供原生排版网页卡片。",
                     "给 http(s):// URL。可选 dump=markdown（默认）| semantic_tree_text。",
                     "例：用户说“打开这个动态页面看看内容”→ url=…"
                 )
@@ -168,6 +198,18 @@ impl Tool for WebReadTool {
                 ErrorKind::InvalidInput,
                 format!("web.read 只支持 http(s):// URL，收到：{url}"),
             );
+        }
+        // structure=true → 交 read_page_structure：跑页面内抽取脚本，返回
+        // 结构化正文 JSON（title/host/nav/blocks），供 AION 原生排版成网页卡片。
+        let structure = args
+            .get("structure")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if structure {
+            return match read_page_structure(url) {
+                Ok(page) => ToolResult::success(page),
+                Err(msg) => ToolResult::error(ErrorKind::ExternalService, msg),
+            };
         }
         let dump = args
             .get("dump")
@@ -241,6 +283,75 @@ fn read_page_moli(url: &str, dump: &str) -> Result<Value, String> {
             ""
         },
     }))
+}
+
+/// `moli fetch --eval <STRUCT_JS> --wait-until done --timeout 25000 <url>`：
+/// 在页面内跑 `STRUCT_JS`（真实 DOM 已就绪），把「导航 + 正文结构」抽成干净
+/// JSON 回来。结果不改写整页 markdown，而是给 AION 逐块原生排版（网页卡片）。
+fn read_page_structure(url: &str) -> Result<Value, String> {
+    let args = [
+        "fetch",
+        "--eval",
+        STRUCT_JS,
+        "--wait-until",
+        "done",
+        "--timeout",
+        "25000",
+        url,
+    ];
+    let out = run_moli(&args, 60_000)?;
+    if !out.status.success() {
+        return Err(describe_moli_failure(&out, url));
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stdout = stdout.trim().to_string();
+    // Moli `--eval` 的结果以「值」写 stdout：对象时是紧凑 JSON 单行。
+    let mut v: Value = match serde_json::from_str(&stdout) {
+        Ok(v) => v,
+        Err(e) => {
+            return Err(format!(
+                "Moli structure 脚本输出无法解析为 JSON: {e}\nstdout={}",
+                cap(stdout.clone(), 300)
+            ));
+        }
+    };
+    let blocks = v
+        .get("blocks")
+        .and_then(|b| b.as_array())
+        .map(|b| b.len())
+        .unwrap_or(0);
+    if blocks == 0 {
+        return Err(format!(
+            "{url} 的正文结构为空 —— 可能是登录墙/验证码/纯 API 站，DOM 里没有可排版的正文。\
+             \n要读它的数据请改用 web.fetch，或直调该接口（带登录态）。"
+        ));
+    }
+    if let Some(o) = v.as_object_mut() {
+        o.insert("engine".into(), json!("moli"));
+        o.insert("source".into(), json!("dom-structure"));
+    }
+    Ok(v)
+}
+
+/// 把 Moli 非零退出翻译成人话（markdown 与 structure 两条路径共用）。
+fn describe_moli_failure(out: &std::process::Output, url: &str) -> String {
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    let lower = err.to_ascii_lowercase();
+    // 该地址返回非 HTML 原始数据（接口/下载）时 Moli 会拒做转换 ——
+    // 翻译成人话，并指向正确姿势（取数据走 web.fetch 或直调其 API，而非 web.read）。
+    if lower.contains("raw download") || lower.contains("--dump json") {
+        return format!(
+            "{url} 返回的是非 HTML 原始数据（API 接口 / 文件下载），不是可渲染网页。\
+             \n要读它的数据请改用 web.fetch，或直调该接口（带登录态）。"
+        );
+    }
+    let snippet: String = collapse(&err).chars().take(300).collect();
+    let hint = if snippet.is_empty() {
+        "无错误输出".to_string()
+    } else {
+        snippet
+    };
+    format!("Moli 读取失败(exit {}): {hint}", out.status.code().unwrap_or(-1))
 }
 
 /// 定位 Moli 二进制。
