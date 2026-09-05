@@ -488,14 +488,20 @@ async fn run_agentic_loop(
         new_history.push(ChatMessage::assistant("已展示全部渲染器样例。".to_string()));
         return out;
     }
-    // 开发命令「弹一个百度」：真实抓取百度首页 → 走与 LLM 完全相同的工具链
-    // （run_consented → runtime.execute → result_to_blocks），跳过模型以做确定性验证。
-    if last_user == "弹一个百度" || last_user == "打开百度" || last_user == "baidu demo" {
+    // 开发命令「弹 <URL>」/「弹一个百度」：绕过模型，确定性走真实工具链
+    // （run_consented → runtime.execute → result_to_blocks），跳过模型以做验证。
+    // 普通站走 web.fetch（原生重排）；任意/动态/JS 站走 web.read（Moli 无头引擎跑 JS 后出真实正文）。
+    if let Some(pop_url) = parse_dev_pop(&last_user) {
         let mut out = empty();
         let tu = ToolUseBlock {
             id: CallId::new().as_str().to_string(),
-            name: "web.fetch".into(),
-            input: serde_json::json!({ "url": "https://www.baidu.com" }),
+            name: if pop_url.contains("baidu.com") {
+                "web.fetch"
+            } else {
+                "web.read"
+            }
+            .into(),
+            input: serde_json::json!({ "url": pop_url }),
         };
         let tc = ToolCall {
             call_id: CallId::new(),
@@ -511,9 +517,7 @@ async fn run_agentic_loop(
                 let _ = t.send(b.to_string());
             }
         }
-        new_history.push(ChatMessage::assistant(
-            "已抓取百度首页并原生重排进画布（真实网络请求）。".to_string(),
-        ));
+        new_history.push(ChatMessage::assistant(format!("已读取 {pop_url} 并入画布。")));
         return out;
     }
     let model = match ctx.require::<ModelService>().await {
@@ -870,6 +874,35 @@ fn result_to_blocks(tu: &ToolUseBlock, result_json: &serde_json::Value) -> Vec<s
                 "meta": format!("HTTP {status} · {}", human_size(bytes)),
             })]
         }
+        "web.read" => {
+            // Moli 无头引擎读回来的正文（跑完 JS 的真实内容）→ markdown 块。
+            let url = data.get("url").and_then(|v| v.as_str()).unwrap_or("");
+            let content = data.get("content").and_then(|v| v.as_str()).unwrap_or("");
+            let empty = data.get("empty").and_then(|v| v.as_bool()).unwrap_or(false);
+            if empty {
+                return vec![serde_json::json!({
+                    "type": "text",
+                    "markdown": format!(
+                        "🌐 `{url}`\n\n{}",
+                        data.get("hint")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("Moli 读到空内容")
+                    ),
+                })];
+            }
+            let chars = data.get("chars").and_then(|v| v.as_u64()).unwrap_or(0);
+            let body: String = content.chars().take(6000).collect();
+            let clipped = body.chars().count() < content.chars().count();
+            let meta = if clipped {
+                format!("`Moli 渲染 · 全文 {chars} 字，以下为节选`")
+            } else {
+                format!("`Moli 渲染 · {chars} 字`")
+            };
+            vec![serde_json::json!({
+                "type": "markdown",
+                "markdown": format!("{meta}\n\n{body}"),
+            })]
+        }
         _ => {
             let pretty = serde_json::to_string_pretty(&data).unwrap_or_default();
             let body: String = pretty.chars().take(3000).collect();
@@ -878,6 +911,24 @@ fn result_to_blocks(tu: &ToolUseBlock, result_json: &serde_json::Value) -> Vec<s
                 "markdown": format!("`{}`\n```json\n{body}\n```", tu.name),
             })]
         }
+    }
+}
+
+/// 开发命令「弹 …」的 URL 解析。识别：`弹一个百度`/`打开百度`/`baidu demo`，
+/// 以及 `弹 https://…` 这类带显式 URL 的输入；非弹站命令返回 None（走正常 LLM 流程）。
+fn parse_dev_pop(msg: &str) -> Option<String> {
+    let msg = msg.trim();
+    if msg == "弹一个百度" || msg == "打开百度" || msg == "baidu demo" {
+        return Some("https://www.baidu.com".to_string());
+    }
+    let rest = msg.strip_prefix("弹")?.trim();
+    let rest = rest
+        .trim_start_matches(|c| c == ':' || c == '：')
+        .trim();
+    if rest.starts_with("http://") || rest.starts_with("https://") {
+        Some(rest.to_string())
+    } else {
+        None
     }
 }
 

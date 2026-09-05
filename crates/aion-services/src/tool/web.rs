@@ -89,6 +89,194 @@ impl Tool for WebFetchTool {
     }
 }
 
+// ---------------------------------------------------------------------------
+// `web.read` —— 真·读任意页：壳调 Moli（无头浏览器引擎，跑 JS + 原生 DOM）
+// ---------------------------------------------------------------------------
+//
+// `web.fetch` 只做单次匿名 GET，SPA/JS 渲染站拿到的是空壳，登录墙/验证码站
+// 更是拿不到内容。`web.read` 把抓取交给 Moli——一个 Rust 自研的无头浏览器
+// 内核：它真实执行页面 JavaScript、维护 DOM、可按需等加载完成，再把「跑完
+// JS 之后的真实内容」渲染成 Markdown（或语义树）吐回来。AION 不进浏览器、
+// 不碰像素，只消费结构文本。
+//
+// Moli 二进制定位：env `AION_MOLI` → `$HOME/.local/bin/moli` → PATH 上的 `moli`。
+pub struct WebReadTool {
+    def: ToolDefinition,
+}
+
+impl WebReadTool {
+    pub fn new() -> Self {
+        Self {
+            def: ToolDefinition {
+                name: "web.read".into(),
+                description: concat!(
+                    "用 Moli 无头浏览器引擎读取网页（真实执行页面 JavaScript 并等其加载完），",
+                    "返回渲染成 Markdown 的正文。适合 JS 渲染的 SPA/动态站、或普通抓取拿到空壳的页面。",
+                    "给 http(s):// URL。可选 dump=markdown（默认）| semantic_tree_text。",
+                    "例：用户说“打开这个动态页面看看内容”→ url=…"
+                )
+                .into(),
+                input: JsonSchemaDocument::new(JsonSchema::Object {
+                    properties: BTreeMap::from([
+                        (
+                            "url".into(),
+                            Box::new(JsonSchema::String {
+                                min_length: Some(8),
+                                max_length: Some(2048),
+                                pattern: None,
+                            }),
+                        ),
+                        (
+                            "dump".into(),
+                            Box::new(JsonSchema::String {
+                                min_length: Some(3),
+                                max_length: Some(32),
+                                pattern: None,
+                            }),
+                        ),
+                    ]),
+                    required: vec!["url".into()],
+                    additional: Box::new(JsonSchema::Any),
+                }),
+                output: None,
+                required_caps: vec!["net:fetch".into()],
+                risk: Risk::Low,
+            },
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for WebReadTool {
+    fn definition(&self) -> &ToolDefinition {
+        &self.def
+    }
+
+    async fn call(
+        &self,
+        _ctx: &cordis::Context,
+        _scope: &ToolCallScope,
+        args: Value,
+    ) -> ToolResult {
+        let url = args
+            .get("url")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        if !(url.starts_with("https://") || url.starts_with("http://")) {
+            return ToolResult::error(
+                ErrorKind::InvalidInput,
+                format!("web.read 只支持 http(s):// URL，收到：{url}"),
+            );
+        }
+        let dump = args
+            .get("dump")
+            .and_then(|v| v.as_str())
+            .unwrap_or("markdown")
+            .trim();
+        let dump = match dump {
+            "semantic_tree_text" | "semantic_tree" => "semantic_tree_text",
+            _ => "markdown",
+        };
+        match read_page_moli(url, dump) {
+            Ok(page) => ToolResult::success(page),
+            Err(msg) => ToolResult::error(ErrorKind::ExternalService, msg),
+        }
+    }
+}
+
+/// 调 `moli fetch --dump <dump> --wait-until done <url>`，把 stdout 包装成
+/// 结构化 JSON（内容超长截断到 `MOLI_MAX_CHARS`）。
+fn read_page_moli(url: &str, dump: &str) -> Result<Value, String> {
+    const MOLI_MAX_CHARS: usize = 60_000;
+    let args = [
+        "fetch",
+        "--dump",
+        dump,
+        "--wait-until",
+        "done",
+        "--timeout",
+        "25000",
+        url,
+    ];
+    let out = run_moli(&args, 60_000)?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr).into_owned();
+        let snippet: String = collapse(&err).chars().take(300).collect();
+        let hint = if snippet.is_empty() {
+            "无错误输出".to_string()
+        } else {
+            snippet
+        };
+        return Err(format!(
+            "Moli 读取失败(exit {}): {hint}",
+            out.status.code().unwrap_or(-1)
+        ));
+    }
+    let body = String::from_utf8_lossy(&out.stdout).into_owned();
+    let body = body.trim().to_string();
+    let total = body.chars().count();
+    let body = cap(body, MOLI_MAX_CHARS);
+    let empty = body.trim().is_empty();
+    Ok(json!({
+        "engine": "moli",
+        "url": url,
+        "dump": dump,
+        "content": body,
+        "chars": total,
+        "truncated": total > MOLI_MAX_CHARS,
+        "empty": empty,
+        "hint": if empty {
+            "Moli 拿到空内容 —— 可能是登录墙/401/反爬，或该地址本就无正文（如纯 API 站）。"
+        } else {
+            ""
+        },
+    }))
+}
+
+/// 定位 Moli 二进制。
+fn moli_bin() -> String {
+    if let Ok(p) = std::env::var("AION_MOLI") {
+        if !p.trim().is_empty() {
+            return p.trim().to_string();
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        let cand = format!("{home}/.local/bin/moli");
+        if std::path::Path::new(&cand).exists() {
+            return cand;
+        }
+    }
+    "moli".to_string()
+}
+
+/// 起一个 Moli 子进程并带超时地等它结束。
+///
+/// 关键超时控制靠传 `--timeout` 让 Moli 自尽；这里的 `max_ms` 只是兜底看门狗，
+/// 兜底触发时进程可能短暂残留，但 Moli 自带超时会先到，故实际很少走到。
+fn run_moli(args: &[&str], max_ms: u64) -> Result<std::process::Output, String> {
+    let bin = moli_bin();
+    let mut child = std::process::Command::new(&bin)
+        .args(args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| {
+            format!(
+                "启动 Moli 失败(`{bin}`): {e} —— 需先在机器上装 Moli(见 AION_MOLI env)"
+            )
+        })?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+    match rx.recv_timeout(Duration::from_millis(max_ms)) {
+        Ok(Ok(o)) => Ok(o),
+        Ok(Err(e)) => Err(format!("读取 Moli 输出失败：{e}")),
+        Err(_) => Err(format!("Moli 超过 {max_ms}ms 未返回（页面可能卡死），已放弃。")),
+    }
+}
+
 /// 抓取 + 提取，出错返回人类可读的 Err 串。
 async fn fetch_page(url: &str) -> Result<Value, String> {
     let client = reqwest::Client::builder()

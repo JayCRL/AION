@@ -289,6 +289,7 @@ pub fn populate_builtin_registry(reg: &ToolRegistry) -> CordisResult<()> {
     reg.register(terminal::TerminalExecTool::new()).map_err(err)?;
     reg.register(system::SystemStatsTool::new()).map_err(err)?;
     reg.register(web::WebFetchTool::new()).map_err(err)?;
+    reg.register(web::WebReadTool::new()).map_err(err)?;
     // Silence the unused ErrorKind import warning if any; the symbol is used inline.
     let _ = ErrorKind::Internal;
     Ok(())
