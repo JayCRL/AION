@@ -605,6 +605,32 @@ async fn run_agentic_loop(
         new_history.push(ChatMessage::assistant(format!("已查看 {fpath} 并入画布。")));
         return out;
     }
+    // 开发命令「放视频 / 播放 <URL>」：确定性走 media.view → app.open（本机播放器弹窗）。
+    if let Some(murl) = parse_dev_media(&last_user) {
+        let mut out = empty();
+        let cap_tu = ToolUseBlock {
+            id: CallId::new().as_str().to_string(),
+            name: "media.view".into(),
+            input: serde_json::json!({ "url": murl }),
+        };
+        let tu = resolve_leaf_tu(&state.capabilities, &cap_tu);
+        let tc = ToolCall {
+            call_id: CallId::new(),
+            tool: tu.name.clone(),
+            arguments: tu.input.clone(),
+            sandbox: Some(ToolSandboxHint::Default),
+        };
+        let result = run_consented(state, ctx, runtime, sec, session_id, &tc).await;
+        let rj = serde_json::to_value(&result).unwrap_or(serde_json::Value::Null);
+        for b in result_to_blocks(&tu, &rj) {
+            out.blocks.push(b.clone());
+            if let Some(t) = &tx {
+                let _ = t.send(b.to_string());
+            }
+        }
+        new_history.push(ChatMessage::assistant(format!("已交给本机播放器放 {murl}。")));
+        return out;
+    }
     let model = match ctx.require::<ModelService>().await {
         Ok(m) => m,
         Err(e) => {
@@ -1087,6 +1113,30 @@ fn parse_dev_file(msg: &str) -> Option<String> {
             .trim_start_matches(|c| c == ':' || c == '：')
             .trim();
         if rest.starts_with('/') || rest.starts_with("~/") {
+            return Some(rest.to_string());
+        }
+        return None;
+    }
+    None
+}
+
+/// 开发命令「放视频 / 播放 <URL>」的解析：确定性走 media.view → app.open 链路。
+/// 只认后接 http(s) URL 的放视频句（如「放这个视频 https://…」）；否则返回 None 走 LLM。
+fn parse_dev_media(msg: &str) -> Option<String> {
+    let msg = msg.trim();
+    for pre in [
+        "放视频", "播放视频", "放个这个视频", "放这个视频", "放那个视频", "放一个视频", "播放",
+    ] {
+        let Some(rest) = msg.strip_prefix(pre) else {
+            continue;
+        };
+        let rest = rest
+            .trim_start_matches(|c| c == ':' || c == '：')
+            .trim_start_matches("一个")
+            .trim()
+            .trim_start_matches(|c| c == ':' || c == '：')
+            .trim();
+        if rest.starts_with("http://") || rest.starts_with("https://") {
             return Some(rest.to_string());
         }
         return None;
