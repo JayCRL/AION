@@ -491,6 +491,14 @@ fn brand_for(url: &str) -> (String, String) {
     (name, "#1E6FFF".into())
 }
 
+/// 该 URL 是否命中「已知站点皮肤」清单（web.fetch 原生重排优先）。
+/// `web.view` 能力选 Provider 时与 `brand_for` 用同一份 host 判断。
+pub fn is_known_skin_site(url: &str) -> bool {
+    let host = host_of(url).to_ascii_lowercase();
+    const SKIN_HOSTS: [&str; 4] = ["baidu.com", "wust.edu.cn", "github.com", "bilibili.com"];
+    SKIN_HOSTS.iter().any(|s| host.contains(s))
+}
+
 fn host_of(url: &str) -> String {
     let origin = origin_of(url);
     origin

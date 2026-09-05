@@ -12,11 +12,23 @@ use std::collections::BTreeMap;
 
 use serde_json::{json, Value};
 
+use crate::capability::CapabilityDefinition;
 use crate::schema::{JsonSchema, JsonSchemaDocument};
 use crate::tool::ToolDefinition;
 
 /// 把 `ToolDefinition` 转成 Anthropic `tools` 数组元素形状。
 pub fn tool_to_anthropic(def: &ToolDefinition) -> Value {
+    json!({
+        "name": def.name,
+        "description": def.description,
+        "input_schema": document_to_schema(&def.input),
+    })
+}
+
+/// 把 `CapabilityDefinition` 转成 Anthropic `tools` 数组元素形状。
+///
+/// 与 `tool_to_anthropic` 同构——模型侧能力名就是可调用名，只是描述面向目标。
+pub fn capability_to_anthropic(def: &CapabilityDefinition) -> Value {
     json!({
         "name": def.name,
         "description": def.description,

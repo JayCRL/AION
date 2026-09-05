@@ -37,6 +37,7 @@
 #![doc = "\u{0041}AION \u{4e0a}\u{4e00}\u{4ee3} Phase 1"]
 
 pub mod call;
+pub mod capability;
 pub mod error;
 pub mod event;
 pub mod llm_schema;
@@ -50,6 +51,7 @@ pub mod ui;
 /// `use aion_protocol::prelude::*;`
 pub mod prelude {
     pub use crate::call::{CallId, ToolCall, ToolSandboxHint};
+    pub use crate::capability::CapabilityDefinition;
     pub use crate::error::{ProtocolError, SchemaError};
     pub use crate::event::{AionEvent, AionEventKind};
     pub use crate::result::{Artifact, ErrorKind, PathKind, RequestId, ResultStatus, ToolResult};

@@ -20,9 +20,10 @@ use std::convert::Infallible;
 use std::sync::Arc;
 use tower_http::cors::CorsLayer;
 
-use aion_protocol::llm_schema::tool_to_anthropic;
+use aion_protocol::llm_schema::{capability_to_anthropic, tool_to_anthropic};
 use aion_protocol::prelude::*;
 
+use aion_services::capability::CapabilityRegistry;
 use aion_services::model::{
     ChatMessage, ModelService, ToolResultBlock, ToolUseBlock,
 };
@@ -30,6 +31,9 @@ use aion_services::security::SecurityContext;
 use aion_services::{
     backend_from_provider, LlmProtocol, LlmProvider, LlmProviderStore,
 };
+
+/// Capability 已覆盖的叶子工具：不再直接暴露给模型（能力内部按 URL/意图解析选择）。
+const PROVIDER_ONLY_TOOLS: [&str; 2] = ["web.fetch", "web.read"];
 
 /// 一条等待用户确认的挂起命令（登记于 `AppState.pending`）。
 struct PendingApproval {
@@ -45,6 +49,8 @@ struct PendingApproval {
 pub struct AppState {
     pub ctx: cordis::Context,
     pub tool_runtime: Arc<aion_services::tool::ToolRuntime>,
+    /// Capability 注册表（目标导向接口 → 解析到叶子 Provider）。
+    pub capabilities: CapabilityRegistry,
     /// cc-switch 式 LLM 供应商存储（持久化于 aion.providers.json）。
     pub llm_store: Arc<LlmProviderStore>,
     /// 会话历史（内存态，Phase 3 简化版）。
@@ -78,9 +84,11 @@ pub async fn run(port: u16) -> anyhow::Result<()> {
         }
     }
 
+    let capabilities = aion_services::register_builtin_capabilities();
     let state = Arc::new(AppState {
         ctx: ctx.clone(),
         tool_runtime,
+        capabilities,
         llm_store,
         sessions: tokio::sync::Mutex::new(HashMap::new()),
         pending: tokio::sync::Mutex::new(HashMap::new()),
@@ -217,19 +225,34 @@ async fn api_health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 
 async fn api_tools(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let registry = state.tool_runtime.registry();
-    let tools: Vec<serde_json::Value> = registry
+    // Capability（目标导向接口）
+    let mut items: Vec<serde_json::Value> = state
+        .capabilities
         .list()
         .into_iter()
         .map(|def| {
             serde_json::json!({
+                "kind": "capability",
                 "name": def.name,
+                "summary": def.summary,
                 "description": def.description,
                 "required_caps": def.required_caps,
                 "risk": def.risk.as_str(),
+                "providers": def.providers,
             })
         })
         .collect();
-    Json(serde_json::json!({ "tools": tools, "count": tools.len() }))
+    // 叶子工具（provider-only 叶子被能力遮住，但保留在清单里供内省）
+    for def in registry.list() {
+        items.push(serde_json::json!({
+            "kind": "tool",
+            "name": def.name,
+            "description": def.description,
+            "required_caps": def.required_caps,
+            "risk": def.risk.as_str(),
+        }));
+    }
+    Json(serde_json::json!({ "tools": items, "count": items.len() }))
 }
 
 // ---------------------------------------------------------------------------
@@ -360,18 +383,28 @@ struct AgenticOutcome {
     paused: bool,
 }
 
-/// 组装每轮请求的 system：ASSISTANT_SYSTEM + 当前注册工具清单。
+/// 组装每轮请求的 system：ASSISTANT_SYSTEM + 能力清单（目标）+ 暴露的叶子工具清单。
 /// 工具细节走原生 `tools` 参数；这里用一句话清单让模型先知道有什么可用。
-fn assistant_system_with_tools(runtime: &aion_services::tool::ToolRuntime) -> String {
+fn assistant_system_with_tools(
+    runtime: &aion_services::tool::ToolRuntime,
+    caps: &CapabilityRegistry,
+) -> String {
     let mut list = String::new();
+    // 能力是给模型看的目标导向接口（摘要）；provider-only 叶子被遮住。
+    for c in caps.list() {
+        list.push_str(&format!("- {}：{}\n", c.name, c.summary));
+    }
     for d in runtime.registry().list() {
+        if PROVIDER_ONLY_TOOLS.contains(&d.name.as_str()) {
+            continue;
+        }
         list.push_str(&format!("- {}：{}\n", d.name, d.description));
     }
     format!(
-        "{}\n\n# 可用工具\n\
-         本次对话我已把工具以原生 `tools` 形式提供；需要查询/修改本机状态时请直接发起工具调用，\
+        "{}\n\n# 可用工具 / 能力\n\
+         本次对话我已把工具以原生 `tools` 形式提供；需要查询/修改本机/浏览网页时请直接发起工具调用，\
          不要臆造输出。\n\
-         可用工具：\n{list}\n\
+         可用项：\n{list}\n\
          # 回退\n\
          若拿不到 `tools`（纯文本模式），需要执行命令时仍可用 ```run 代码块发出，AION 会自动执行并回喂输出。",
         aion::agents::assistant::ASSISTANT_SYSTEM
@@ -379,13 +412,36 @@ fn assistant_system_with_tools(runtime: &aion_services::tool::ToolRuntime) -> St
 }
 
 /// 把注册表里的工具转成 Anthropic `tools` 数组（模型原生调用协议）。
-fn build_llm_tools(runtime: &aion_services::tool::ToolRuntime) -> Vec<serde_json::Value> {
-    runtime
-        .registry()
-        .list()
-        .iter()
-        .map(tool_to_anthropic)
-        .collect()
+/// 组成 = 全部 Capability（目标导向，模型优先用它们）+ 未被能力遮住的叶子工具。
+fn build_llm_tools(
+    runtime: &aion_services::tool::ToolRuntime,
+    caps: &CapabilityRegistry,
+) -> Vec<serde_json::Value> {
+    let mut out: Vec<serde_json::Value> = caps.list().iter().map(capability_to_anthropic).collect();
+    for d in runtime.registry().list() {
+        if !PROVIDER_ONLY_TOOLS.contains(&d.name.as_str()) {
+            out.push(tool_to_anthropic(&d));
+        }
+    }
+    out
+}
+
+/// 把模型发来的一次 `tool_use` 解析成真正执行的叶子 ToolUseBlock。
+///
+/// 若 `tu.name` 是已注册 Capability（如 `web.view`），用 resolver 落成一个叶子
+/// Provider（如 `web.read{url,structure}`）；否则（普通叶子工具 / ```run 回退的
+/// terminal.exec）原样返回。这样主循环只认叶子：schema 校验、run_consented、
+/// result_to_blocks 全都不感知能力层，能力只在此处解引用。
+fn resolve_leaf_tu(caps: &CapabilityRegistry, tu: &ToolUseBlock) -> ToolUseBlock {
+    if let Some(rp) = caps.resolve(&tu.name, &tu.input) {
+        ToolUseBlock {
+            id: tu.id.clone(),
+            name: rp.tool,
+            input: rp.arguments,
+        }
+    } else {
+        tu.clone()
+    }
 }
 
 /// 结果是否为执行失败（error / denied）。
@@ -489,24 +545,16 @@ async fn run_agentic_loop(
         return out;
     }
     // 开发命令「弹 <URL>」/「弹一个百度」：绕过模型，确定性走真实工具链
-    // （run_consented → runtime.execute → result_to_blocks），跳过模型以做验证。
-    // 普通站走 web.fetch（原生重排）；任意/动态/JS 站走 web.read（Moli 无头引擎跑 JS 后出真实正文）。
+    // （web.view 能力 → resolver 选 Provider → run_consented → result_to_blocks），
+    // 跳过模型以做验证：普通站(已知皮肤)走 web.fetch 原生重排，其余走 web.read。
     if let Some(pop_url) = parse_dev_pop(&last_user) {
         let mut out = empty();
-        let tu = ToolUseBlock {
+        let cap_tu = ToolUseBlock {
             id: CallId::new().as_str().to_string(),
-            name: if pop_url.contains("baidu.com") {
-                "web.fetch"
-            } else {
-                "web.read"
-            }
-            .into(),
-            // 非百度站走 structure 模式：取 DOM 结构 → 原生 page 卡（比 markdown 原文更好看）。
-            input: serde_json::json!({
-                "url": pop_url,
-                "structure": !pop_url.contains("baidu.com"),
-            }),
+            name: "web.view".into(),
+            input: serde_json::json!({ "url": pop_url }),
         };
+        let tu = resolve_leaf_tu(&state.capabilities, &cap_tu);
         let tc = ToolCall {
             call_id: CallId::new(),
             tool: tu.name.clone(),
@@ -538,7 +586,7 @@ async fn run_agentic_loop(
             return empty();
         }
     };
-    let tools = build_llm_tools(runtime);
+    let tools = build_llm_tools(runtime, &state.capabilities);
     let mut out = empty();
     let mut rounds = 0usize;
     loop {
@@ -546,7 +594,7 @@ async fn run_agentic_loop(
         if rounds > 6 {
             break;
         }
-        let system = ChatMessage::system(assistant_system_with_tools(runtime));
+        let system = ChatMessage::system(assistant_system_with_tools(runtime, &state.capabilities));
         let recent = recent_context(new_history, 20);
         let mut cont = Vec::with_capacity(recent.len() + 1);
         cont.push(system);
@@ -629,7 +677,10 @@ async fn run_agentic_loop(
         let mut results: Vec<ToolResultBlock> = Vec::new();
         let mut paused = false;
         for tu in tuses {
-            let cmd = tu.input.get("command").and_then(|v| v.as_str()).unwrap_or_default();
+            // 能力（web.view 等）→ 叶子 Provider；普通叶子原样。schema 校验/执行/
+            // result_to_blocks 都只看叶子，能力只在这里解引用一次。
+            let leaf = resolve_leaf_tu(&state.capabilities, &tu);
+            let cmd = leaf.input.get("command").and_then(|v| v.as_str()).unwrap_or_default();
             if let Some(t) = &tx {
                 let _ = t.send(
                     serde_json::json!({ "type": "tool", "tool": tu.name, "command": cmd })
@@ -638,8 +689,8 @@ async fn run_agentic_loop(
             }
             let tc = ToolCall {
                 call_id: CallId::new(),
-                tool: tu.name.clone(),
-                arguments: tu.input.clone(),
+                tool: leaf.name.clone(),
+                arguments: leaf.input.clone(),
                 sandbox: Some(ToolSandboxHint::Default),
             };
             out.tool_calls.push(serde_json::json!({
@@ -662,7 +713,7 @@ async fn run_agentic_loop(
             executed.push(tu.clone());
             let result_json = serde_json::to_value(&result).unwrap_or(serde_json::Value::Null);
             out.tool_results.push(result_json.clone());
-            for b in result_to_blocks(&tu, &result_json) {
+            for b in result_to_blocks(&leaf, &result_json) {
                 out.blocks.push(b.clone());
                 if let Some(t) = &tx {
                     let _ = t.send(b.to_string());

@@ -14,6 +14,7 @@
 //! | [`device`]   | 设备管理（GPU/USB 枚举与访问控制） |
 //! | [`model`]    | 模型服务（LLM 后端抽象，内置 Echo 后端） |
 
+pub mod capability;
 pub mod device;
 pub mod error;
 pub mod fs;
@@ -30,6 +31,9 @@ pub mod tool;
 
 use aion_adapter::AdapterKit;
 
+pub use capability::{
+    register_builtin_capabilities, CapabilityRegistry, ResolvedProvider,
+};
 pub use error::{AionError, AionResult};
 pub use provider::{backend_from_provider, LlmProtocol, LlmProvider, LlmProviderStore};
 pub use sandbox::SandboxRequest;
