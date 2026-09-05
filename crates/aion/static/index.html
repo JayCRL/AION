@@ -14,28 +14,12 @@ body{font-family:'Inter',-apple-system,sans-serif;background:var(--bg);color:var
 ::-webkit-scrollbar{width:4px}
 ::-webkit-scrollbar-thumb{background:rgba(255,255,255,.1);border-radius:2px}
 
-/* ── ambient background:暗底星点 + 五彩小灯闪烁 ── */
-.stars{position:fixed;inset:0;pointer-events:none;z-index:0;overflow:hidden}
-/* 极淡静止星点铺底(一次性绘制,零逐帧成本),让彩灯更醒目 */
+/* ── ambient background:武科大实景底图(静态)── */
+.stars{position:fixed;inset:0;pointer-events:none;z-index:0;overflow:hidden;
+  background:#050508 url('/bg-wust.jpg') center/cover no-repeat}
+/* 上透下深的压暗罩,保证 logo / 输入框 / 聊天消息在任何画面下可读 */
 .stars::before{content:'';position:absolute;inset:0;background:
-  radial-gradient(1px 1px at 12% 18%,rgba(255,255,255,.3),transparent),
-  radial-gradient(1px 1px at 84% 22%,rgba(255,255,255,.26),transparent),
-  radial-gradient(1px 1px at 38% 70%,rgba(255,255,255,.24),transparent),
-  radial-gradient(1px 1px at 70% 60%,rgba(255,255,255,.2),transparent),
-  radial-gradient(1px 1px at 92% 82%,rgba(255,255,255,.22),transparent),
-  radial-gradient(1px 1px at 56% 34%,rgba(255,255,255,.26),transparent),
-  radial-gradient(1px 1px at 22% 52%,rgba(255,255,255,.22),transparent),
-  radial-gradient(1px 1px at 63% 90%,rgba(255,255,255,.18),transparent),
-  radial-gradient(1px 1px at 15% 40%,rgba(255,255,255,.2),transparent)}
-/* 五彩小灯泡:JS 铺 ~56 颗,白热灯芯+彩光晕,随机颜色/尺寸/周期/负相位「亮→灭」闪 */
-.stars .spk{position:absolute;border-radius:50%;opacity:0;
-  background:radial-gradient(circle, rgba(255,255,255,.98) 0%, rgba(255,255,255,0) 100%);
-  animation:lmp 2.4s ease-in-out infinite}
-@keyframes lmp{0%,56%,100%{opacity:0;transform:scale(.72)}16%,42%{opacity:1;transform:scale(1.1)}}
-/* 桌面 lite(?lite=1,软渲染/无GPU 下加载):逐帧动画与毛玻璃在 WebKit 非合成模式
-   下会变成"每帧全屏软件重绘",吃满一核。此模式下全部关掉;浏览器保持全特效。 */
-body.lite .stars::before,body.lite .stars .spk{animation:none}
-body.lite .stars .spk{opacity:.28}
+  linear-gradient(180deg, rgba(5,5,10,.40) 0%, rgba(5,5,10,.60) 52%, rgba(5,5,10,.85) 100%)}
 body.lite .logo-img,body.lite .logo-ring{animation:none}
 body.lite .logo-text,body.lite .logo-tag,body.lite .logo-sub,body.lite .os-clock{opacity:1;animation:none}
 body.lite *{-webkit-backdrop-filter:none!important;backdrop-filter:none!important}
@@ -189,22 +173,6 @@ body.lite .input-box{background:rgba(255,255,255,.09);border-color:rgba(255,255,
 </head>
 <body class="state-landing"><script>if(location.search.indexOf('lite')>-1)document.body.classList.add('lite')</script>
 <div class="stars"></div>
-<script>(function(){var s=document.querySelector('.stars');if(!s)return;
-var lite=document.body.classList.contains('lite');
-/* 五彩小灯泡:节日色板,白热芯 + 彩色光晕,随机色/尺寸/周期/负相位 */
-var P=[[255,255,255],[248,113,113],[251,146,60],[251,191,36],[74,222,128],[34,211,238],[96,165,250],[167,139,250],[244,114,182]];
-function bulb(c){return 'radial-gradient(circle, rgba(255,255,255,.98) 0%, rgba('+c[0]+','+c[1]+','+c[2]+',1) 26%, rgba('+c[0]+','+c[1]+','+c[2]+',0) 80%)';}
-var n=lite?22:56;for(var i=0;i<n;i++){
-  var d=document.createElement('i');d.className='spk';
-  var c=P[Math.random()*P.length|0];
-  var big=Math.random()<.1;
-  var sz=(big?Math.random()*4+11:Math.random()*4.5+5.5).toFixed(1);
-  d.style.background=bulb(c);
-  d.style.cssText+='left:'+(Math.random()*100).toFixed(2)+'%;top:'+(Math.random()*96).toFixed(2)+'%;width:'+sz+'px;height:'+sz+'px;';
-  d.style.animationDuration=(Math.random()*1.8+1.5).toFixed(2)+'s';
-  d.style.animationDelay='-'+((Math.random()*3.2).toFixed(2))+'s';
-  s.appendChild(d);}
-})();</script>
 <div class="os-clock"><span class="clk-t" id="clkT">--:--</span><span class="clk-d" id="clkD"></span></div>
 
 <!-- logo -->
