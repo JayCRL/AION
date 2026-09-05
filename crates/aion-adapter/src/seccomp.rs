@@ -189,18 +189,24 @@ impl SeccompAdapter for NativeSeccompAdapter {
     }
 }
 
-/// 沙箱默认允许的系统调用清单（x86_64 / aarch64 通用子集）。
+/// 沙箱默认允许的系统调用清单（x86_64 / aarch64 都可用）。
 ///
 /// 覆盖动态链接 C 程序的完整启动路径（ld.so + glibc）：含 robust list /
 /// rseq / prlimit64 / 系统信息查询等；清单策略为「默认拒绝 + EPERM」，
 /// 实际生产工作负载应按需收紧。
+///
+/// 架构差异：x86_64 遗留了一批旧式系统调用（`open`/`access`/`readlink`/
+/// `pipe`/`dup2`/`time`/`arch_prctl`），但 aarch64 等走 asm-generic 表的架构
+/// **没有这些**（glibc 改用 `openat`/`faccessat`/`readlinkat`/`pipe2`/`dup3`），
+/// `libc::SYS_*` 里根本不存在它们，直接引用会编不过。故把它们收进
+/// `#[cfg(target_arch = "x86_64")]` 一段——x86_64 行为不变，其他架构自然拿到
+/// 通用子集。
 #[cfg(target_os = "linux")]
 pub fn default_allowlist() -> Vec<i64> {
-    const SYS: &[i64] = &[
+    let mut allow: Vec<i64> = vec![
         // 文件 IO
         libc::SYS_read as i64,
         libc::SYS_write as i64,
-        libc::SYS_open as i64,
         libc::SYS_openat as i64,
         libc::SYS_close as i64,
         libc::SYS_fstat as i64,
@@ -215,9 +221,7 @@ pub fn default_allowlist() -> Vec<i64> {
         libc::SYS_getdents64 as i64,
         libc::SYS_faccessat as i64,
         libc::SYS_faccessat2 as i64,
-        libc::SYS_access as i64,
         libc::SYS_statx as i64,
-        libc::SYS_readlink as i64,
         libc::SYS_readlinkat as i64,
         libc::SYS_statfs as i64,
         libc::SYS_fstatfs as i64,
@@ -238,17 +242,14 @@ pub fn default_allowlist() -> Vec<i64> {
         libc::SYS_set_tid_address as i64,
         libc::SYS_rseq as i64,
         libc::SYS_futex as i64,
-        libc::SYS_pipe as i64,
         libc::SYS_pipe2 as i64,
         libc::SYS_dup as i64,
-        libc::SYS_dup2 as i64,
         libc::SYS_dup3 as i64,
         // 时间
         libc::SYS_nanosleep as i64,
         libc::SYS_clock_nanosleep as i64,
         libc::SYS_clock_gettime as i64,
         libc::SYS_gettimeofday as i64,
-        libc::SYS_time as i64,
         // 进程 / 系统
         libc::SYS_getpid as i64,
         libc::SYS_getppid as i64,
@@ -266,7 +267,6 @@ pub fn default_allowlist() -> Vec<i64> {
         libc::SYS_getrlimit as i64,
         libc::SYS_getcwd as i64,
         libc::SYS_chdir as i64,
-        libc::SYS_arch_prctl as i64,
         libc::SYS_prctl as i64,
         libc::SYS_membarrier as i64,
         libc::SYS_execve as i64,
@@ -275,7 +275,18 @@ pub fn default_allowlist() -> Vec<i64> {
         libc::SYS_wait4 as i64,
         libc::SYS_waitid as i64,
     ];
-    SYS.to_vec()
+    // x86_64 遗留系统调用（见上：asm-generic 表没有，glibc 不用，仅 x86_64 保留）
+    #[cfg(target_arch = "x86_64")]
+    allow.extend([
+        libc::SYS_open as i64,
+        libc::SYS_access as i64,
+        libc::SYS_readlink as i64,
+        libc::SYS_pipe as i64,
+        libc::SYS_dup2 as i64,
+        libc::SYS_time as i64,
+        libc::SYS_arch_prctl as i64,
+    ]);
+    allow
 }
 
 #[cfg(not(target_os = "linux"))]
