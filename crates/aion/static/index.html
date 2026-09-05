@@ -57,7 +57,7 @@ body.lite .input-box{background:rgba(255,255,255,.09);border-color:rgba(255,255,
 /* ── landing state ── */
 .state-landing .logo-wrap{top:32%;left:50%;transform:translate(-50%,-50%)}
 .state-landing .logo-img{width:140px;height:140px}
-.state-landing .input-shell{top:58%;left:50%;transform:translate(-50%,-50%);width:520px}
+.state-landing .input-shell{top:58%;left:50%;transform:translate(-50%,-50%);width:min(520px,92vw)}
 .state-landing #chatArea{opacity:0;pointer-events:none}
 .state-landing .gear-btn{position:fixed;bottom:24px;left:24px;z-index:20}
 
@@ -271,6 +271,56 @@ body.lite .input-box{background:rgba(255,255,255,.09);border-color:rgba(255,255,
 .typing-dots span:nth-child(2){animation-delay:.2s}
 .typing-dots span:nth-child(3){animation-delay:.4s}
 @keyframes bnc{0%,60%,100%{transform:translateY(0)}30%{transform:translateY(-6px)}}
+
+/* ── mobile（≤760px）窄屏 / 触屏适配 ──
+   纯叠层：桌面段不受影响。手机=横竖都能用：landing 收缩居中、chat 顶条右齿轮 + 底部通栏输入条、
+   设置改底部抽屉、宽表格卡片内横滚、触控目标放大、字号防 iOS 聚焦缩放。env(safe-area-inset) 兜刘海。 */
+@media (max-width:760px){
+  /* landing：logo / 输入框缩放进屏 */
+  .state-landing .logo-wrap{top:26%}
+  .state-landing .logo-img{width:92px;height:92px}
+  .state-landing .logo-ring{top:-8px;left:-8px;right:-8px;bottom:-8px}
+  .state-landing .logo-text{font-size:22px;letter-spacing:4px}
+  .state-landing .logo-tag{font-size:11.5px;letter-spacing:4px}
+  .state-landing .logo-sub{font-size:11px;max-width:86vw;text-align:center;line-height:1.5}
+  .state-landing .input-shell{width:min(480px,92vw)}
+
+  /* 顶条：左品牌 · 右齿轮 · 模型芯片居中偏右；聊天态隐藏时钟(手机自带状态栏钟) */
+  .state-chat .os-clock{display:none}
+  .state-chat .logo-wrap{top:8px;left:12px;gap:7px}
+  .state-chat .logo-img{width:26px;height:26px}
+  .state-chat .logo-text{font-size:13px;letter-spacing:2px}
+  .gear-btn{top:8px;top:calc(8px + env(safe-area-inset-top));left:auto;right:12px;bottom:auto;width:38px;height:38px}
+  .model-chip{left:auto;right:60px;bottom:auto;top:14px;top:calc(14px + env(safe-area-inset-top));max-width:40vw;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;justify-content:flex-end}
+
+  /* 底部输入条：近满宽、贴底、触控加大（env 刘海兜底） */
+  .state-chat .input-shell{width:calc(100vw - 20px);bottom:10px;bottom:calc(10px + env(safe-area-inset-bottom))}
+  .input-box{padding:10px 14px;border-radius:22px;gap:8px}
+  .input-box input{font-size:16px;min-height:24px}
+  .send-ico{width:40px;height:40px;flex:none}
+  .send-ico svg{width:18px;height:18px}
+
+  /* 消息区：在顶条与输入条之间通栏，读起来更大 */
+  #chatArea{top:48px;bottom:74px;bottom:calc(74px + env(safe-area-inset-bottom));left:0;right:0;padding:8px 12px 4px;gap:12px}
+  .msg{max-width:100%}
+  .bubble{font-size:15px;line-height:1.66;padding:11px 14px}
+  .blk-pg .pg-tt{font-size:18px}
+
+  /* 富内容：宽表格在卡片内横向滚动，不把整页撑破 */
+  .blk-tbl{display:block;overflow-x:auto;-webkit-overflow-scrolling:touch}
+  .blk-tbl th,.blk-tbl td{white-space:nowrap}
+
+  /* 设置：底部抽屉、触控目标放大、表单字号防 iOS 聚焦缩放 */
+  .modal-ov{align-items:flex-end}
+  .modal{width:100%;max-width:100vw;max-height:90vh;border-radius:18px 18px 0 0;padding:20px 16px calc(18px + env(safe-area-inset-bottom))}
+  .tab-bar{overflow-x:auto}
+  .tab{flex:1;padding:10px 6px;font-size:13.5px;text-align:center}
+  .fg input,.fg select{font-size:16px}
+  .save-btn{padding:12px;font-size:16px}
+  .mini-btn{padding:7px 13px;font-size:12px}
+  .btn{padding:9px 18px;font-size:14px}
+  .blk-cfm .btns{flex-wrap:wrap}
+}
 </style>
 </head>
 <body class="state-landing"><script>if(location.search.indexOf('lite')>-1)document.body.classList.add('lite')</script>
