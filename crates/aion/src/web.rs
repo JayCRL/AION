@@ -89,6 +89,7 @@ pub async fn run(port: u16) -> anyhow::Result<()> {
     let app = Router::new()
         .route("/", get(index_handler))
         .route("/logo.png", get(logo_handler))
+        .route("/bg-wust.jpg", get(bg_handler))
         .route("/api/health", get(api_health))
         .route("/api/tools", get(api_tools))
         .route("/api/chat", post(api_chat))
@@ -136,6 +137,8 @@ pub async fn run(port: u16) -> anyhow::Result<()> {
 /// 编译期内嵌版本(兜底,保证自包含)。
 const EMBED_INDEX: &str = include_str!("../static/index.html");
 const EMBED_LOGO: &[u8] = include_bytes!("../static/logo.png");
+/// 桌面登录背景(武科大校园实景)。磁盘优先:直接换 static/bg-wust.jpg 即热更。
+const EMBED_BG: &[u8] = include_bytes!("../static/bg-wust.jpg");
 
 /// 磁盘前端目录:`AION_STATIC_DIR`,未设置返回 None(走内嵌)。
 fn static_dir() -> Option<std::path::PathBuf> {
@@ -168,6 +171,17 @@ async fn logo_handler() -> Response {
     };
     Response::builder()
         .header("Content-Type", "image/png")
+        .body(axum::body::Body::from(bytes))
+        .unwrap()
+}
+
+async fn bg_handler() -> Response {
+    let bytes = match disk_static("bg-wust.jpg").await {
+        Some(b) => b,
+        None => EMBED_BG.to_vec(),
+    };
+    Response::builder()
+        .header("Content-Type", "image/jpeg")
         .body(axum::body::Body::from(bytes))
         .unwrap()
 }
