@@ -202,6 +202,15 @@ fn read_page_moli(url: &str, dump: &str) -> Result<Value, String> {
     let out = run_moli(&args, 60_000)?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr).into_owned();
+        let lower = err.to_ascii_lowercase();
+        // 该地址返回非 HTML 原始数据（接口/下载）时 Moli 会拒做 markdown ——
+        // 翻译成人话，并指向正确姿势（取数据走 web.fetch 或直调其 API，而非 web.read）。
+        if lower.contains("raw download") || lower.contains("--dump json") {
+            return Err(format!(
+                "{url} 返回的是非 HTML 原始数据（API 接口 / 文件下载），不是可渲染网页。\
+                 \n要读它的数据请改用 web.fetch，或直调该接口（带登录态）。"
+            ));
+        }
         let snippet: String = collapse(&err).chars().take(300).collect();
         let hint = if snippet.is_empty() {
             "无错误输出".to_string()
