@@ -84,3 +84,8 @@ rm -rf ~/.config/aion          # 注意：这会删掉已配的 LLM 供应商与
 
 AION 是**有本机执行能力**的 Agent OS。安装即代表你信任它在本用户权限内跑工具；
 高风险命令（高危 shell、装系统包）都会弹确认框等你点「同意」才执行。
+
+沙箱在无特权时自动降级：非 root 运行的 AION 无法建 cgroup v2 子组或隔离 namespace
+（需要 root / systemd delegate 授权）。此时资源限制与进程隔离**尽力而为**，启动日志会
+如实标 `cgroup ✗ · namespace ✗`，进程照常运行——不影响使用，只是进程不额外套资源墙。
+要真隔离：以 root 配 `systemd Delegate` 或直接以 root 运行 AION。
