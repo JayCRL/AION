@@ -24,6 +24,11 @@ use serde_json::{json, Value};
 /// 媒体播放器白名单：也用于 http(s) 在线媒体 URL（站点视频交给 yt-dlp 解析）。
 const MEDIA_PLAYERS: &[&str] = &["vlc", "mpv", "ffplay", "mplayer"];
 
+/// 冒充浏览器的 UA——B 站等 CDN 边缘防盗链要求「Referer + 浏览器 UA」双全，缺一 403
+/// （实测: no-header/referer-only/UA-only 全 403，referer+UA → 200）。
+const BROWSER_UA: &str =
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36";
+
 /// 扩展名 → 候选查看器（白名单；顺序即优先级）。空 = 无匹配，走 `xdg-open` 兜底。
 fn viewer_candidates(ext: &str) -> Vec<&'static str> {
     match ext {
@@ -330,6 +335,7 @@ impl Tool for AppOpenTool {
                 .unwrap_or(false);
             if is_mpv {
                 if let Some(origin) = origin_of(&path) {
+                    cmd.arg(format!("--user-agent={BROWSER_UA}"));
                     cmd.arg(format!("--http-header-fields=Referer: {origin}/"));
                 }
             }
