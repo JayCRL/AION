@@ -21,6 +21,9 @@ use async_trait::async_trait;
 use cordis::Context;
 use serde_json::{json, Value};
 
+/// 媒体播放器白名单：也用于 http(s) 在线媒体 URL（站点视频交给 yt-dlp 解析）。
+const MEDIA_PLAYERS: &[&str] = &["vlc", "mpv", "ffplay", "mplayer"];
+
 /// 扩展名 → 候选查看器（白名单；顺序即优先级）。空 = 无匹配，走 `xdg-open` 兜底。
 fn viewer_candidates(ext: &str) -> Vec<&'static str> {
     match ext {
@@ -31,7 +34,7 @@ fn viewer_candidates(ext: &str) -> Vec<&'static str> {
         }
         // 媒体：能放视频 / 音频的播放器
         "mp4" | "mkv" | "avi" | "mov" | "webm" | "m4v" | "mp3" | "flac" | "wav" | "m4a"
-        | "ogg" | "opus" | "aac" => vec!["vlc", "mpv", "ffplay", "mplayer"],
+        | "ogg" | "opus" | "aac" => MEDIA_PLAYERS.to_vec(),
         // 文档：PDF / PostScript / DjVu
         "pdf" | "ps" | "djvu" => vec!["evince", "zathura", "okular", "mupdf", "qpdfview"],
         // 办公 / 电子书
@@ -174,13 +177,21 @@ impl Tool for AppOpenTool {
                 "`path` 不能为空",
             );
         }
+        // http(s) 在线媒体 URL：不按扩展名分派，直接走媒体播放器白名单。mpv 集成
+        // yt-dlp 时站点视频（B 站/优酷…）的页面 URL 可直放，否则请先手动解析出直链。
+        let is_url = path.starts_with("http://") || path.starts_with("https://");
         let ext = Path::new(&path)
             .extension()
             .and_then(|e| e.to_str())
             .unwrap_or("")
             .to_ascii_lowercase();
+        let allowed: Vec<&str> = if is_url {
+            MEDIA_PLAYERS.to_vec()
+        } else {
+            viewer_candidates(&ext)
+        };
 
-        // 候选顺序：app= 显式（须在该扩展名的白名单内）> 扩展名映射 > xdg-open 兜底。
+        // 候选顺序：app= 显式（须在对应的白名单内）> 类型映射 > xdg-open 兜底(仅本地文件)。
         let mut names: Vec<&str> = Vec::new();
         if let Some(app) = args
             .get("app")
@@ -188,28 +199,32 @@ impl Tool for AppOpenTool {
             .map(str::trim)
             .filter(|s| !s.is_empty())
         {
-            let allowed = viewer_candidates(&ext);
             if allowed.contains(&app) {
                 names.push(app);
             } else {
                 return ToolResult::error(
                     aion_protocol::result::ErrorKind::InvalidInput,
-                    format!("`app`={app} 不在白名单；.{ext} 的可用候选为 {allowed:?}"),
+                    format!("`app`={app} 不在白名单；{allowed:?} 之外不可用（{ext}）"),
                 );
             }
         } else {
-            names = viewer_candidates(&ext);
+            names = allowed.clone();
         }
         let fallback = "xdg-open";
-        if names.is_empty() {
+        if names.is_empty() && !is_url {
             names.push(fallback);
         }
+        let label = if is_url { "在线媒体 URL" } else { &ext };
 
-        let bin = which_bin(&names).or_else(|| which_bin(&[fallback]));
+        let bin = if is_url {
+            which_bin(&names)
+        } else {
+            which_bin(&names).or_else(|| which_bin(&[fallback]))
+        };
         let Some(bin) = bin else {
             return ToolResult::error(
                 aion_protocol::result::ErrorKind::NotFound,
-                format!("未找到能打开 .{ext} 文件的程序（试过 {names:?}）；请安装 vlc/evince/libreoffice"),
+                format!("未找到能打开 {label} 的程序（试过 {names:?}）；媒体请装 vlc/mpv，文件请装 feh/zathura/libreoffice"),
             );
         };
 

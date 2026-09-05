@@ -264,6 +264,56 @@ pub fn register_builtin_capabilities() -> CapabilityRegistry {
 
     reg.register(fdef, fresolver)
         .expect("register file.view capability");
+
+    // ======================================================================
+    // media.view —— 播放一段在线视频 / 音频（URL → 本机播放器弹窗）
+    // ======================================================================
+    //
+    // 「放这个视频 <B站链接>」这类目标不该逼 Agent 去拼 terminal/process 命令（那会
+    // 撞 High risk 确认门、命令还容易写空）。media.view 把 http(s) URL 交给 app.open
+    // 叶子 → mpv/vlc 弹窗播放；站点视频由 yt-dlp 解析出真实流。Low risk，不设确认门。
+    let mdef = CapabilityDefinition {
+        name: "media.view".into(),
+        summary: "播放一段在线视频 / 音频（给 http(s) URL，用本机播放器弹窗放，支持 B 站等视频站）".into(),
+        description: concat!(
+            "播放 url 指向的在线视频或音频，播放器窗口直接弹到桌面。这是看在线媒体内容的统一入口：",
+            "无需自己拼命令行、无需抓流——AION 用本机已装的播放器（mpv/vlc）打开，视频站页面由 ",
+            "yt-dlp 自动解析出真实媒体流。给 url 即可。例：用户说“放这个视频 ",
+            "https://www.bilibili.com/video/BVxxxx” → url 填这个链接。"
+        )
+        .into(),
+        input: JsonSchemaDocument::new(JsonSchema::Object {
+            properties: BTreeMap::from([(
+                "url".into(),
+                Box::new(JsonSchema::String {
+                    min_length: Some(8),
+                    max_length: Some(4096),
+                    pattern: None,
+                }),
+            )]),
+            required: vec!["url".into()],
+            additional: Box::new(JsonSchema::Any),
+        }),
+        required_caps: vec!["process:spawn".into()],
+        risk: Risk::Low,
+        providers: vec!["app.open".into()],
+    };
+
+    let mresolver: Box<Resolver> = Box::new(|input: &Value| {
+        let url = input
+            .get("url")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        ResolvedProvider {
+            tool: "app.open".into(),
+            arguments: json!({ "path": url }),
+        }
+    });
+
+    reg.register(mdef, mresolver)
+        .expect("register media.view capability");
     reg
 }
 
