@@ -29,7 +29,8 @@ use aion_services::model::{
 };
 use aion_services::security::SecurityContext;
 use aion_services::{
-    backend_from_provider, LlmProtocol, LlmProvider, LlmProviderStore,
+    backend_from_provider, dep_satisfied, CapabilityStore, LlmProtocol, LlmProvider,
+    LlmProviderStore,
 };
 
 /// Capability 已覆盖的叶子工具：不再直接暴露给模型（能力内部按 URL/意图解析选择）。
@@ -59,6 +60,8 @@ pub struct AppState {
     pub capabilities: CapabilityRegistry,
     /// cc-switch 式 LLM 供应商存储（持久化于 aion.providers.json）。
     pub llm_store: Arc<LlmProviderStore>,
+    /// 能力广场开关状态（持久化于 aion.capabilities.json，未记录 = 启用）。
+    pub cap_store: Arc<CapabilityStore>,
     /// 会话历史（内存态，Phase 3 简化版）。
     pub sessions: tokio::sync::Mutex<HashMap<String, Vec<ChatMessage>>>,
     /// 等待用户确认的挂起动作（key = RequestId，与 UIBlock::Confirmation 配对）。
@@ -91,11 +94,13 @@ pub async fn run(port: u16) -> anyhow::Result<()> {
     }
 
     let capabilities = aion_services::register_builtin_capabilities();
+    let cap_store = Arc::new(CapabilityStore::load_default());
     let state = Arc::new(AppState {
         ctx: ctx.clone(),
         tool_runtime,
         capabilities,
         llm_store,
+        cap_store,
         sessions: tokio::sync::Mutex::new(HashMap::new()),
         pending: tokio::sync::Mutex::new(HashMap::new()),
     });
@@ -118,6 +123,19 @@ pub async fn run(port: u16) -> anyhow::Result<()> {
         .route("/api/llm/providers/:id/activate", post(api_llm_activate))
         .route("/api/llm/providers/:id", delete(api_llm_delete))
         .route("/api/sessions", get(api_sessions).post(api_new_session))
+        .route("/api/capabilities", get(api_capabilities))
+        .route(
+            "/api/capabilities/:name/enable",
+            post(api_cap_enable),
+        )
+        .route(
+            "/api/capabilities/:name/disable",
+            post(api_cap_disable),
+        )
+        .route(
+            "/api/capabilities/:name/install",
+            post(api_cap_install),
+        )
         .layer(CorsLayer::permissive())
         .with_state(state);
 
@@ -237,6 +255,7 @@ async fn api_tools(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         .list()
         .into_iter()
         .map(|def| {
+            let enabled = state.cap_store.is_enabled(&def.name);
             serde_json::json!({
                 "kind": "capability",
                 "name": def.name,
@@ -245,6 +264,7 @@ async fn api_tools(State(state): State<Arc<AppState>>) -> impl IntoResponse {
                 "required_caps": def.required_caps,
                 "risk": def.risk.as_str(),
                 "providers": def.providers,
+                "enabled": enabled,
             })
         })
         .collect();
@@ -259,6 +279,110 @@ async fn api_tools(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         }));
     }
     Json(serde_json::json!({ "tools": items, "count": items.len() }))
+}
+
+// ---------------------------------------------------------------------------
+// Capability 广场 API — 列出（含开关 + 依赖满足度）、开关、安装依赖
+// ---------------------------------------------------------------------------
+
+/// 能力广场主清单：每能力带 `enabled`（开关态）+ 逐依赖 `satisfied`（现算）。
+async fn api_capabilities(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let store = &state.cap_store;
+    let caps: Vec<serde_json::Value> = state
+        .capabilities
+        .list()
+        .into_iter()
+        .map(|def| {
+            let enabled = store.is_enabled(&def.name);
+            let deps: Vec<serde_json::Value> = def
+                .deps
+                .iter()
+                .map(|d| {
+                    serde_json::json!({
+                        "label": d.label,
+                        "binaries": d.binaries,
+                        "satisfied": dep_satisfied(d),
+                        "method": d.method,
+                    })
+                })
+                .collect();
+            serde_json::json!({
+                "name": def.name,
+                "summary": def.summary,
+                "description": def.description,
+                "risk": def.risk.as_str(),
+                "required_caps": def.required_caps,
+                "providers": def.providers,
+                "enabled": enabled,
+                "deps": deps,
+                "all_deps_ok": def.deps.iter().all(|d| dep_satisfied(d)),
+            })
+        })
+        .collect();
+    Json(serde_json::json!({ "capabilities": caps }))
+}
+
+/// 开关 `enable` / `disable`：写入 CapabilityStore 并持久化。
+async fn api_cap_set(
+    state: &AppState,
+    name: &str,
+    on: bool,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    if !state.capabilities.has(name) {
+        return Err(err_json(
+            StatusCode::NOT_FOUND,
+            &format!("capability `{name}` not found"),
+        ));
+    }
+    state
+        .cap_store
+        .set_enabled(name, on)
+        .map_err(|e| err_json(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+    Ok(Json(serde_json::json!({
+        "status": "ok",
+        "name": name,
+        "enabled": on,
+    })))
+}
+
+async fn api_cap_enable(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    api_cap_set(&state, &name, true).await
+}
+
+async fn api_cap_disable(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    api_cap_set(&state, &name, false).await
+}
+
+/// 用户点「安装」= 已显式同意：直接同步执行 `system.install`（高危，但绕过确认门，
+/// 按钮本身即同意）。返回该工具完整 ToolResult——前端据 `result.data.deps[]` 渲染。
+async fn api_cap_install(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    if !state.capabilities.has(&name) {
+        return Err(err_json(
+            StatusCode::NOT_FOUND,
+            &format!("capability `{name}` not found"),
+        ));
+    }
+    let ctx = state.ctx.clone();
+    let runtime = state.tool_runtime.clone();
+    let sec = aion::agents::developer_sec("web-user", &[]);
+    let tc = ToolCall {
+        call_id: CallId::new(),
+        tool: "system.install".into(),
+        arguments: serde_json::json!({ "capability": name }),
+        sandbox: Some(ToolSandboxHint::Default),
+    };
+    let result = runtime.execute(&ctx, tc, sec).await;
+    let rj = serde_json::to_value(&result).unwrap_or(serde_json::Value::Null);
+    Ok(Json(serde_json::json!({ "status": "ok", "result": rj })))
 }
 
 // ---------------------------------------------------------------------------
@@ -336,6 +460,62 @@ fn terminal_confirm_block(request_id: &RequestId, command: &str) -> UIBlock {
     })
 }
 
+/// system.install 的确认框（模型主动让 AION 装依赖时弹出）。
+fn install_confirm_block(request_id: &RequestId, capability: &str) -> UIBlock {
+    UIBlock::Confirmation(ConfirmationBlock {
+        request_id: request_id.clone(),
+        title: "确认补装能力依赖".into(),
+        description: format!(
+            "Agent 请求给能力 `{capability}` 补装缺失的外部软件依赖。\n\n\
+             将按 AION 内置清单安装：用户级独立二进制会下载到 ~/.local/bin（免 root）；\
+             系统包尝试 sudo -n apt-get（需已配 NOPASSWD，否则会提示你手动执行）。"
+        ),
+        consequences: vec![
+            "安装会改动本机软件环境（新增 ~/.local/bin 二进制或 apt 系统包）。".to_string(),
+            "仅在信任该能力所需依赖时选择「同意安装」。".to_string(),
+        ],
+        options: vec![
+            ConfirmationOption {
+                choice: "confirm".into(),
+                label: "同意安装".into(),
+                description: None,
+                style: ConfirmationStyle::Danger,
+            },
+            ConfirmationOption {
+                choice: "cancel".into(),
+                label: "拒绝".into(),
+                description: None,
+                style: ConfirmationStyle::Ghost,
+            },
+        ],
+        default_choice: "cancel".into(),
+    })
+}
+
+/// 高危工具挂起时的确认块 + 摘要 + 展示串：
+/// `terminal.exec` 展示命令本身；`system.install` 展示要装的能力名。
+fn confirm_block_for(request_id: &RequestId, tc: &ToolCall) -> (UIBlock, String, String) {
+    if tc.tool == "system.install" {
+        let cap = tc
+            .arguments
+            .get("capability")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let block = install_confirm_block(request_id, &cap);
+        (block, format!("等待你确认给能力 `{cap}` 补装依赖"), format!("system.install {cap}"))
+    } else {
+        let command = tc
+            .arguments
+            .get("command")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let block = terminal_confirm_block(request_id, &command);
+        (block, format!("等待你确认执行：{command}"), command)
+    }
+}
+
 /// 带同意门的单步执行：
 /// - 低风险命令 → 直接执行，返回真实结果；
 /// - 高风险命令 → 登记挂起（`AppState.pending`），返回 `ResultStatus::Pending`，
@@ -351,29 +531,20 @@ async fn run_consented(
     if !runtime.effective_risk(tc).requires_confirmation() {
         return runtime.execute(ctx, tc.clone(), sec.clone()).await;
     }
-    let command = tc
-        .arguments
-        .get("command")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
     let request_id = RequestId::new();
-    let block = terminal_confirm_block(&request_id, &command);
+    let (block, summary, command) = confirm_block_for(&request_id, tc);
     state.pending.lock().await.insert(
         request_id.clone(),
         PendingApproval {
             tool_call: tc.clone(),
             session_id: session_id.to_string(),
-            command: command.clone(),
+            command,
         },
     );
     ToolResult {
         call_id: tc.call_id.clone(),
-        status: ResultStatus::Pending {
-            request_id,
-            summary: format!("等待你确认执行：{command}"),
-        },
-        data: serde_json::json!({ "command": command }),
+        status: ResultStatus::Pending { request_id, summary },
+        data: serde_json::json!({}),
         artifacts: Vec::new(),
         events: vec![block],
     }
@@ -391,13 +562,18 @@ struct AgenticOutcome {
 
 /// 组装每轮请求的 system：ASSISTANT_SYSTEM + 能力清单（目标）+ 暴露的叶子工具清单。
 /// 工具细节走原生 `tools` 参数；这里用一句话清单让模型先知道有什么可用。
+/// `store`：被禁用的能力不出现在清单里（也不该被模型调用）。
 fn assistant_system_with_tools(
     runtime: &aion_services::tool::ToolRuntime,
     caps: &CapabilityRegistry,
+    store: &CapabilityStore,
 ) -> String {
     let mut list = String::new();
     // 能力是给模型看的目标导向接口（摘要）；provider-only 叶子被遮住。
     for c in caps.list() {
+        if !store.is_enabled(&c.name) {
+            continue;
+        }
         list.push_str(&format!("- {}：{}\n", c.name, c.summary));
     }
     for d in runtime.registry().list() {
@@ -418,12 +594,18 @@ fn assistant_system_with_tools(
 }
 
 /// 把注册表里的工具转成 Anthropic `tools` 数组（模型原生调用协议）。
-/// 组成 = 全部 Capability（目标导向，模型优先用它们）+ 未被能力遮住的叶子工具。
+/// 组成 = 全部启用中的 Capability（目标导向，模型优先用它们）+ 未被能力遮住的叶子工具。
 fn build_llm_tools(
     runtime: &aion_services::tool::ToolRuntime,
     caps: &CapabilityRegistry,
+    store: &CapabilityStore,
 ) -> Vec<serde_json::Value> {
-    let mut out: Vec<serde_json::Value> = caps.list().iter().map(capability_to_anthropic).collect();
+    let mut out: Vec<serde_json::Value> = caps
+        .list()
+        .iter()
+        .filter(|c| store.is_enabled(&c.name))
+        .map(capability_to_anthropic)
+        .collect();
     for d in runtime.registry().list() {
         if !PROVIDER_ONLY_TOOLS.contains(&d.name.as_str()) {
             out.push(tool_to_anthropic(&d));
@@ -438,7 +620,15 @@ fn build_llm_tools(
 /// Provider（如 `web.read{url,structure}`）；否则（普通叶子工具 / ```run 回退的
 /// terminal.exec）原样返回。这样主循环只认叶子：schema 校验、run_consented、
 /// result_to_blocks 全都不感知能力层，能力只在此处解引用。
-fn resolve_leaf_tu(caps: &CapabilityRegistry, tu: &ToolUseBlock) -> ToolUseBlock {
+fn resolve_leaf_tu(
+    caps: &CapabilityRegistry,
+    store: &CapabilityStore,
+    tu: &ToolUseBlock,
+) -> ToolUseBlock {
+    // 被禁用的能力不解析：原样返回 → 执行时「unknown tool」报错，模型会知错转向。
+    if caps.has(&tu.name) && !store.is_enabled(&tu.name) {
+        return tu.clone();
+    }
     if let Some(rp) = caps.resolve(&tu.name, &tu.input) {
         ToolUseBlock {
             id: tu.id.clone(),
@@ -560,7 +750,7 @@ async fn run_agentic_loop(
             name: "web.view".into(),
             input: serde_json::json!({ "url": pop_url }),
         };
-        let tu = resolve_leaf_tu(&state.capabilities, &cap_tu);
+        let tu = resolve_leaf_tu(&state.capabilities, &state.cap_store, &cap_tu);
         let tc = ToolCall {
             call_id: CallId::new(),
             tool: tu.name.clone(),
@@ -587,7 +777,7 @@ async fn run_agentic_loop(
             name: "file.view".into(),
             input: serde_json::json!({ "path": fpath }),
         };
-        let tu = resolve_leaf_tu(&state.capabilities, &cap_tu);
+        let tu = resolve_leaf_tu(&state.capabilities, &state.cap_store, &cap_tu);
         let tc = ToolCall {
             call_id: CallId::new(),
             tool: tu.name.clone(),
@@ -613,7 +803,7 @@ async fn run_agentic_loop(
             name: "media.view".into(),
             input: serde_json::json!({ "url": murl }),
         };
-        let tu = resolve_leaf_tu(&state.capabilities, &cap_tu);
+        let tu = resolve_leaf_tu(&state.capabilities, &state.cap_store, &cap_tu);
         let tc = ToolCall {
             call_id: CallId::new(),
             tool: tu.name.clone(),
@@ -645,7 +835,7 @@ async fn run_agentic_loop(
             return empty();
         }
     };
-    let tools = build_llm_tools(runtime, &state.capabilities);
+    let tools = build_llm_tools(runtime, &state.capabilities, &state.cap_store);
     let mut out = empty();
     let mut rounds = 0usize;
     loop {
@@ -653,7 +843,8 @@ async fn run_agentic_loop(
         if rounds > 6 {
             break;
         }
-        let system = ChatMessage::system(assistant_system_with_tools(runtime, &state.capabilities));
+        let system =
+            ChatMessage::system(assistant_system_with_tools(runtime, &state.capabilities, &state.cap_store));
         let recent = recent_context(new_history, 20);
         let mut cont = Vec::with_capacity(recent.len() + 1);
         cont.push(system);
@@ -738,7 +929,7 @@ async fn run_agentic_loop(
         for tu in tuses {
             // 能力（web.view 等）→ 叶子 Provider；普通叶子原样。schema 校验/执行/
             // result_to_blocks 都只看叶子，能力只在这里解引用一次。
-            let leaf = resolve_leaf_tu(&state.capabilities, &tu);
+            let leaf = resolve_leaf_tu(&state.capabilities, &state.cap_store, &tu);
             let cmd = leaf.input.get("command").and_then(|v| v.as_str()).unwrap_or_default();
             if let Some(t) = &tx {
                 let _ = t.send(
@@ -1334,21 +1525,25 @@ async fn api_action(
     let mut tool_results = Vec::new();
 
     if approved {
-        let command = approval.command.clone();
+        let display = if approval.command.trim().is_empty() {
+            approval.tool_call.tool.clone()
+        } else {
+            approval.command.clone()
+        };
         let tc = approval.tool_call.clone();
         tool_calls.push(serde_json::json!({
             "call_id": tc.call_id.as_str(),
             "tool": tc.tool.clone(),
             "arguments": tc.arguments.clone(),
         }));
-        let result = runtime.execute(&ctx, tc, sec.clone()).await;
+        let result = runtime.execute(&ctx, tc.clone(), sec.clone()).await;
         let result_json = serde_json::to_value(&result).unwrap_or(serde_json::Value::Null);
         tool_results.push(result_json.clone());
 
-        blocks.push(terminal_block(&command, &result_json));
-        let output_text = summarize_tool_output(&result_json);
+        blocks.extend(confirmed_result_blocks(&tc, &display, &result_json));
+        let output_text = summarize_tool_data(&result_json);
         history.push(ChatMessage::user(format!(
-            "用户已同意执行 `{command}`，输出：\n{output_text}"
+            "用户已同意执行 `{display}`，输出：\n{output_text}"
         )));
 
         // 同意后让 agent 接着用原生工具循环续答（可能继续调工具，也可能收尾）
@@ -1466,6 +1661,55 @@ fn terminal_block(command: &str, result_json: &serde_json::Value) -> serde_json:
         "code": data.get("exit_code").and_then(|v| v.as_i64()).unwrap_or(-1),
         "timed_out": data.get("timed_out").and_then(|v| v.as_bool()).unwrap_or(false),
     })
+}
+
+/// 同意恢复执行后的结果展示块：`terminal.exec`（或带 command）→ terminal 块；
+/// `system.install` → 逐依赖结果的文本块。
+fn confirmed_result_blocks(
+    tc: &ToolCall,
+    command: &str,
+    result_json: &serde_json::Value,
+) -> Vec<serde_json::Value> {
+    if tc.tool != "system.install" {
+        return vec![terminal_block(command, result_json)];
+    }
+    let data = tool_result_fields(result_json);
+    let cap = tc
+        .arguments
+        .get("capability")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let all_ok = data.get("all_ok").and_then(|v| v.as_bool()).unwrap_or(false);
+    let mut lines: Vec<String> = Vec::new();
+    if let Some(deps) = data.get("deps").and_then(|v| v.as_array()) {
+        for d in deps {
+            let label = d.get("label").and_then(|v| v.as_str()).unwrap_or("");
+            let status = d.get("status").and_then(|v| v.as_str()).unwrap_or("failed");
+            let mark = match status {
+                "already" => "✓ 已具备",
+                "installed" => "✓ 已安装",
+                "needs_sudo" => "需手动",
+                _ => "✗ 失败",
+            };
+            let hint = d.get("hint").and_then(|v| v.as_str()).unwrap_or("");
+            let hint_txt = if hint.is_empty() {
+                String::new()
+            } else {
+                format!(" — {hint}")
+            };
+            lines.push(format!("- **{label}**：{mark}{hint_txt}"));
+        }
+    }
+    let head = format!(
+        "`{cap}` 依赖安装{}",
+        if all_ok { "完成 ✅" } else { "未完全成功 ⚠️" }
+    );
+    let md = if lines.is_empty() {
+        head
+    } else {
+        format!("{head}\n\n{}", lines.join("\n"))
+    };
+    vec![serde_json::json!({ "type": "text", "markdown": md })]
 }
 
 /// 拆 `reply` 的产物：正文 + 一组 ```run 命令。

@@ -12,6 +12,34 @@ use serde::{Deserialize, Serialize};
 use crate::schema::JsonSchemaDocument;
 use crate::tool::Risk;
 
+/// 依赖项的安装方式。
+///
+/// 能力广场「安装」= 把依赖的可执行软件补装到机器上。优先用户级下载（零 root），
+/// apt 兜底（需 sudo，AION 不在内存放 sudo 密码，只走 `sudo -n` NOPASSWD，否则给手动提示）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum InstallMethod {
+    /// 发行版包管理器安装（需 root）。AION 只尝试 `sudo -n apt-get install -y`；
+    /// 探测到无 NOPASSWD 时返回"请手动执行"提示，不在本进程持密码。
+    Apt { packages: Vec<String> },
+    /// 下载独立二进制/归档到 `~/.local/bin/<to>`（零 root）。
+    /// `extract=true`：内容为 tar（如 moli），解包后按文件名 `<to>` 找可执行文件放到位。
+    Download { url: String, to: String, extract: bool },
+}
+
+/// 能力的一项运行时依赖：一个"可安装单元"。
+///
+/// 判断满足 = `binaries` 里任一名字在 PATH（含 `~/.local/bin`）命中可执行。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CapabilityDep {
+    /// 人类可读标签（"媒体播放器" / "无头网页引擎"）。
+    pub label: String,
+    /// 候选可执行名：任一命中即视为已满足（如 `["mpv","ffplay","vlc"]`）。
+    pub binaries: Vec<String>,
+    /// 未命中时的安装方式。
+    pub method: InstallMethod,
+}
+
 /// 一个 Capability 的描述：Agent 视角的"我能让用户达成什么目标"。
 ///
 /// 与 [`crate::tool::ToolDefinition`] 的区别：
@@ -42,4 +70,8 @@ pub struct CapabilityDefinition {
 
     /// 本能力可落到的叶子 Provider 工具名（内省：一能力多实现）。
     pub providers: Vec<String>,
+
+    /// 本能力运行时依赖的外部软件（广场展示 + 安装器使用）。空 = 无外部依赖。
+    #[serde(default)]
+    pub deps: Vec<CapabilityDep>,
 }

@@ -50,14 +50,24 @@ fn viewer_candidates(ext: &str) -> Vec<&'static str> {
     }
 }
 
-/// 通用 `which`：$PATH 各目录里探第一个可执行；绝对路径直接查。全无 → None。
-fn which_bin(names: &[&str]) -> Option<String> {
+/// 通用 `which`：$PATH 各目录 **外加 `$HOME/.local/bin`**（moli/yt-dlp 等用户级独立
+/// 二进制落点，常不在 systemd 会话的 PATH 里）里探第一个可执行；绝对路径直接查。全无 → None。
+///
+/// `pub(crate)`：capability 依赖满足判定（capability.rs `dep_satisfied`）与
+/// `system.install` 安装后复测都复用这一份，保证「探测 / 安装 / 复测」同一套判定。
+pub(crate) fn which_bin(names: &[&str]) -> Option<String> {
     let path_env = std::env::var("PATH").unwrap_or_default();
-    let dirs: Vec<PathBuf> = path_env
+    let mut dirs: Vec<PathBuf> = path_env
         .split(':')
         .filter(|d| !d.is_empty())
         .map(PathBuf::from)
         .collect();
+    if let Ok(home) = std::env::var("HOME") {
+        let local = PathBuf::from(format!("{home}/.local/bin"));
+        if local.is_dir() {
+            dirs.push(local);
+        }
+    }
     for name in names {
         let p = Path::new(name);
         if p.is_absolute() {

@@ -9,6 +9,7 @@
 
 pub mod app;
 pub mod file;
+pub mod install;
 pub mod process;
 pub mod risk;
 pub mod system;
@@ -286,6 +287,7 @@ pub fn populate_builtin_registry(reg: &ToolRegistry) -> CordisResult<()> {
     reg.register(file::FileReadTool::new()).map_err(err)?;
     reg.register(file::FileWriteTool::new()).map_err(err)?;
     reg.register(file::FileListTool::new()).map_err(err)?;
+    reg.register(install::SystemInstallTool::new()).map_err(err)?;
     reg.register(process::ProcessListTool::new()).map_err(err)?;
     reg.register(process::ProcessStartTool::new()).map_err(err)?;
     reg.register(terminal::TerminalExecTool::new()).map_err(err)?;

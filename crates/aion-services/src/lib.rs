@@ -14,6 +14,7 @@
 //! | [`device`]   | 设备管理（GPU/USB 枚举与访问控制） |
 //! | [`model`]    | 模型服务（LLM 后端抽象，内置 Echo 后端） |
 
+pub mod cap_store;
 pub mod capability;
 pub mod device;
 pub mod error;
@@ -32,9 +33,11 @@ pub mod tool;
 use aion_adapter::AdapterKit;
 
 pub use capability::{
-    image_mime, is_external_ext, is_text_ext, lower_ext, register_builtin_capabilities,
-    viewer_icon, CapabilityRegistry, ResolvedProvider,
+    builtin_capability_deps, capability_deps_satisfied, dep_satisfied, image_mime,
+    is_external_ext, is_text_ext, lower_ext, register_builtin_capabilities, viewer_icon,
+    CapabilityRegistry, ResolvedProvider,
 };
+pub use cap_store::{CapabilityStore, CAPABILITIES_FILE};
 pub use error::{AionError, AionResult};
 pub use provider::{backend_from_provider, LlmProtocol, LlmProvider, LlmProviderStore};
 pub use sandbox::SandboxRequest;

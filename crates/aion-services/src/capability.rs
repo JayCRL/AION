@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use aion_protocol::capability::CapabilityDefinition;
+use aion_protocol::capability::{CapabilityDefinition, CapabilityDep, InstallMethod};
 use aion_protocol::schema::{JsonSchema, JsonSchemaDocument};
 use aion_protocol::tool::Risk;
 use serde_json::{json, Value};
@@ -121,6 +121,7 @@ pub fn register_builtin_capabilities() -> CapabilityRegistry {
         required_caps: vec!["net:fetch".into()],
         risk: Risk::Low,
         providers: vec!["web.fetch".into(), "web.read".into()],
+        deps: deps_web_view(),
     };
 
     let resolver: Box<Resolver> = Box::new(|input: &Value| {
@@ -208,6 +209,7 @@ pub fn register_builtin_capabilities() -> CapabilityRegistry {
         required_caps: vec!["fs:read".into()],
         risk: Risk::Low,
         providers: vec!["file.read".into(), "file.list".into(), "app.open".into()],
+        deps: deps_file_view(),
     };
 
     let fresolver: Box<Resolver> = Box::new(|input: &Value| {
@@ -297,6 +299,7 @@ pub fn register_builtin_capabilities() -> CapabilityRegistry {
         required_caps: vec!["process:spawn".into()],
         risk: Risk::Low,
         providers: vec!["app.open".into()],
+        deps: deps_media_view(),
     };
 
     let mresolver: Box<Resolver> = Box::new(|input: &Value| {
@@ -384,4 +387,113 @@ pub fn lower_ext(path: &str) -> String {
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_ascii_lowercase()
+}
+
+// ======================================================================
+// 能力依赖清单（广场展示 + system.install 安装器共用，single source of truth）
+// ======================================================================
+//
+// 每项 CapabilityDep：`binaries` 任一在 PATH / ~/.local/bin 命中可执行即视为已满足；
+// 未满足时按 `method` 补装。下载类走用户级 `~/.local/bin`（零 root，moli/yt-dlp 先例）；
+// apt 类需 sudo——安装器只尝试 `sudo -n`（NOPASSWD），否则给手动提示，不在本进程持密码。
+
+/// moli 无头引擎（web.read provider 的底层二进制）——GitHub release tar 归档。
+const MOLI_URL: &str =
+    "https://github.com/lexmount/moli/releases/latest/download/moli-x86_64-unknown-linux-gnu.tar";
+/// yt-dlp 独立二进制（media.view 把 B 站等视频站页面解析成直链）。
+const YTDLP_URL: &str = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp";
+
+/// 媒体播放器：media.view 弹窗播放 / file.view 打开本地视频音频。
+fn dep_media_player() -> CapabilityDep {
+    CapabilityDep {
+        label: "媒体播放器".into(),
+        binaries: vec!["mpv".into(), "ffplay".into(), "vlc".into(), "mplayer".into()],
+        method: InstallMethod::Apt {
+            packages: vec!["mpv".into()],
+        },
+    }
+}
+
+/// 视频站解析器：把 B 站等页面 URL 解成真实媒体流（独立二进制，零 root）。
+fn dep_ytdlp() -> CapabilityDep {
+    CapabilityDep {
+        label: "视频站解析 yt-dlp".into(),
+        binaries: vec!["yt-dlp".into()],
+        method: InstallMethod::Download {
+            url: YTDLP_URL.into(),
+            to: "yt-dlp".into(),
+            extract: false,
+        },
+    }
+}
+
+/// 看图程序（file.view 打开图片文件）。
+fn dep_image_viewer() -> CapabilityDep {
+    CapabilityDep {
+        label: "看图程序".into(),
+        binaries: vec!["feh".into(), "eog".into(), "display".into(), "qimgv".into()],
+        method: InstallMethod::Apt {
+            packages: vec!["feh".into()],
+        },
+    }
+}
+
+/// 文档阅读器（file.view 打开 PDF/DJVU）。
+fn dep_doc_viewer() -> CapabilityDep {
+    CapabilityDep {
+        label: "文档阅读器".into(),
+        binaries: vec!["zathura".into(), "evince".into(), "okular".into(), "mupdf".into()],
+        method: InstallMethod::Apt {
+            packages: vec!["zathura".into()],
+        },
+    }
+}
+
+/// 无头网页引擎（web.view → web.read provider 的底层二进制）。
+fn dep_moli() -> CapabilityDep {
+    CapabilityDep {
+        label: "无头网页引擎 moli".into(),
+        binaries: vec!["moli".into()],
+        method: InstallMethod::Download {
+            url: MOLI_URL.into(),
+            to: "moli".into(),
+            extract: true,
+        },
+    }
+}
+
+fn deps_web_view() -> Vec<CapabilityDep> {
+    vec![dep_moli()]
+}
+fn deps_file_view() -> Vec<CapabilityDep> {
+    vec![dep_image_viewer(), dep_doc_viewer(), dep_media_player()]
+}
+fn deps_media_view() -> Vec<CapabilityDep> {
+    vec![dep_media_player(), dep_ytdlp()]
+}
+
+/// 内置能力的依赖清单（能力名 → 依赖表）。
+///
+/// `system.install` 与 `/api/capabilities/:name/install` 只允许**按这份编译期清单**装依赖，
+/// 不接受任意包名/URL——窄口安全原语（与 app.open 同一思路）。
+pub fn builtin_capability_deps() -> BTreeMap<String, Vec<CapabilityDep>> {
+    let mut m = BTreeMap::new();
+    m.insert("web.view".into(), deps_web_view());
+    m.insert("file.view".into(), deps_file_view());
+    m.insert("media.view".into(), deps_media_view());
+    m
+}
+
+/// 判断某能力是否已满足全部运行依赖（没列出的能力视为满足）。
+pub fn capability_deps_satisfied(cap: &str) -> bool {
+    builtin_capability_deps()
+        .get(cap)
+        .map(|deps| deps.iter().all(dep_satisfied))
+        .unwrap_or(true)
+}
+
+/// 判断单个依赖是否已满足：`binaries` 任一命中 PATH / `~/.local/bin`。
+pub fn dep_satisfied(dep: &CapabilityDep) -> bool {
+    let names: Vec<&str> = dep.binaries.iter().map(|s| s.as_str()).collect();
+    crate::tool::app::which_bin(&names).is_some()
 }

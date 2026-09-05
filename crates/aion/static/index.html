@@ -244,6 +244,26 @@ body.lite .input-box{background:rgba(255,255,255,.09);border-color:rgba(255,255,
 .cap-row .plabel{font-size:10px;color:var(--txt2);margin-right:2px}
 .pchip{font-size:10px;padding:2px 9px;border-radius:10px;background:var(--bg3);color:var(--txt2);font-family:monospace;border:1px solid var(--glass-brd)}
 .cap-row .req{margin-top:7px;font-size:10px;color:var(--txt2);font-family:monospace}
+/* 能力广场卡：开关 + 依赖 chip（✓ 绿 / ✗ 红）+ 安装 */
+.cap-card{border:1px solid var(--glass-brd);border-radius:10px;padding:12px 14px;margin-bottom:10px;background:rgba(124,110,228,.04);transition:border-color .2s,opacity .2s}
+.cap-card.off{opacity:.6}
+.cap-card .top{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.cap-card .nm{font-family:monospace;font-size:14px;color:var(--acc);font-weight:600}
+.cap-card .st-badge{font-size:10px;padding:2px 7px;border-radius:4px;font-family:monospace}
+.cap-card .st-badge.on{background:rgba(52,211,153,.15);color:var(--ok);border:1px solid rgba(52,211,153,.25)}
+.cap-card .st-badge.off{background:var(--bg3);color:var(--txt2);border:1px solid var(--glass-brd)}
+.cap-card .sum{font-size:13px;color:var(--txt);margin-top:5px;line-height:1.45}
+.cap-card .provs{margin-top:8px;display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+.cap-card .plabel{font-size:10px;color:var(--txt2);margin-right:2px}
+.cap-card .deps{margin-top:9px;display:flex;flex-direction:column;gap:3px;border-top:1px dashed var(--glass-brd);padding-top:8px}
+.cap-card .dep{display:flex;align-items:center;gap:7px;font-size:11px;color:var(--txt2);line-height:1.4}
+.cap-card .dep .dk{font-size:11px}
+.cap-card .dep .dk.ok{color:var(--ok)}
+.cap-card .dep .dk.no{color:var(--err)}
+.cap-card .dep .dn{font-family:monospace}
+.cap-card .dep .hint{font-size:10px;color:var(--txt2);opacity:.8}
+.cap-card .ops{display:flex;gap:6px;margin-top:11px;flex-wrap:wrap;align-items:center}
+.cap-card .ops .mini-btn:disabled{opacity:.5;cursor:default}
 /* ── provider manager (cc-switch style) ── */
 .prov-row{border:1px solid var(--glass-brd);border-radius:10px;padding:12px 14px;margin-bottom:10px;transition:border-color .2s,background .2s}
 .prov-row.active{border-color:var(--acc);background:rgba(124,110,228,.08)}
@@ -389,7 +409,7 @@ body.lite .input-box{background:rgba(255,255,255,.09);border-color:rgba(255,255,
       <button class="save-btn" id="addProvBtn" style="background:var(--bg3);color:var(--txt)" onclick="showProvForm()">＋ 添加供应商</button>
     </div>
     <div class="tab-content" id="tab-caps">
-      <p style="color:var(--txt2);font-size:11px;margin:0 0 10px">目标导向能力 = 给 Agent 的意图接口，内部落到下方叶子执行（AION 自动选）。</p>
+      <p style="color:var(--txt2);font-size:11px;margin:0 0 10px">能力广场：开关决定该能力是否对 Agent 开放；依赖 ✗ 时可点「安装」补装所需软件（用户级二进制免 root，apt 包需 sudo）。</p>
       <div id="capsList">Loading...</div>
     </div>
     <div class="tab-content" id="tab-tools">
@@ -431,9 +451,10 @@ setInterval(tickClock,1000);tickClock();
 async function init(){
   try{
     let[h,t]=await Promise.all([fetch('/api/health').then(r=>r.json()),fetch('/api/tools').then(r=>r.json())]);
-    renderCaps(t.tools||[]);renderTools(t.tools||[]);
+    renderTools(t.tools||[]);
     renderServices(h.services||[]);
     updateModelChip(h.llm);
+    loadMarketplace();
   }catch(e){console.error(e)}
   loadProviders();
   input.addEventListener('keydown',function(e){if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();send()}});
@@ -610,26 +631,95 @@ function renderTools(tools){
   });
 }
 
-// Capability 卡片：每个能力 = 给 Agent 的目标接口，列出其下的 provider 叶子。
-function renderCaps(tools){
+// ── 能力广场：拉 /api/capabilities → renderMarketplace（开关 + 依赖 + 安装）──
+async function loadMarketplace(){
   let el=document.getElementById('capsList');
-  let caps=(tools||[]).filter(function(x){return x.kind==='capability'});
+  try{
+    let d=await fetch('/api/capabilities').then(function(r){return r.json()});
+    renderMarketplace(d.capabilities||[]);
+  }catch(e){
+    if(el)el.innerHTML='<p style="color:var(--err);font-size:13px">加载广场失败: '+esc(e.message)+'</p>';
+  }
+}
+
+// 依赖安装方式的展示文案（按 method JSON 的 kind）。
+function capDepMethodHint(m){
+  m=m||{};
+  if(m.kind==='apt')return 'apt：'+(m.packages||[]).join(' ');
+  if(m.kind==='download')return '下载到 ~/.local/bin'+(m.extract?'（tar 解包）':'');
+  return '';
+}
+
+// 能力广场卡片：每能力 = 给 Agent 的目标接口。含开关（禁用/启用）、
+// 逐依赖满足状态（✓ 绿 / ✗ 红）、缺依赖时的「安装」按钮。
+function renderMarketplace(caps){
+  let el=document.getElementById('capsList');
+  if(!el)return;
   if(!caps.length){el.innerHTML='<p style="color:var(--txt2);font-size:13px">No capabilities registered</p>';return}
   el.innerHTML='';
   caps.forEach(function(c){
-    let chips=(c.providers||[]).map(function(p){return '<span class="pchip">'+esc(p)+'</span>'}).join('');
-    let req=(c.required_caps||[]).join(', ');
-    let d=document.createElement('div');d.className='cap-row';
+    let missing=(c.deps||[]).filter(function(x){return !x.satisfied});
+    let depsHtml='';
+    if((c.deps||[]).length){
+      let rows=(c.deps||[]).map(function(x){
+        let st=x.satisfied;
+        let bin=(x.binaries||[]).join('/');
+        return '<div class="dep"><span class="dk '+(st?'ok':'no')+'">'+(st?'✓':'✗')+'</span>'
+          +'<span class="dn">'+esc(x.label)+'</span>'
+          +'<span>'+esc(bin)+'</span>'
+          +'<span class="hint">'+capDepMethodHint(x.method)+'</span></div>';
+      }).join('');
+      depsHtml='<div class="deps">'+rows+'</div>';
+    }
+    let nameAttr=escA(c.name);
+    let d=document.createElement('div');d.className='cap-card'+(c.enabled?'':' off');
     d.innerHTML=
       '<div class="top"><span class="nm">'+esc(c.name)+'</span>'+
-      '<span class="vis">暴露给模型</span>'+
-      '<span class="risk risk-'+c.risk+'">'+c.risk+'</span></div>'+
+      '<span class="st-badge '+(c.enabled?'on':'off')+'">'+(c.enabled?'已启用':'已禁用')+'</span>'+
+      '<span class="risk risk-'+esc(c.risk)+'">'+esc(c.risk)+'</span></div>'+
       '<div class="sum">'+esc(c.summary)+'</div>'+
-      (c.description?'<div class="desc">'+esc(c.description)+'</div>':'')+
-      (chips?'<div class="provs"><span class="plabel">↓ provider</span>'+chips+'</div>':'')+
-      (req?'<div class="req">required_caps: '+esc(req)+'</div>':'');
+      ((c.providers||[]).length?'<div class="provs"><span class="plabel">↓ provider</span>'
+        +(c.providers||[]).map(function(p){return '<span class="pchip">'+esc(p)+'</span>'}).join('')+'</div>':'')+
+      depsHtml+
+      '<div class="ops">'+
+      '<button class="mini-btn '+(c.enabled?'danger':'primary')+'" onclick="setCapEnabled(\''+nameAttr+'\','+(c.enabled?'false':'true')+')">'+(c.enabled?'禁用':'启用')+'</button>'+
+      (missing.length
+        ?'<button class="mini-btn primary" onclick="installCap(\''+nameAttr+'\',this)">安装 '+missing.length+' 项依赖</button>'
+        :'<span style="font-size:11px;color:var(--ok)">依赖就绪 ✓</span>')+
+      '</div>';
     el.appendChild(d);
   });
+}
+
+// 开关：POST enable/disable → 刷新。
+async function setCapEnabled(name,on){
+  try{
+    let r=await fetch('/api/capabilities/'+encodeURIComponent(name)+(on?'/enable':'/disable'),{method:'POST'});
+    if(!r.ok)throw new Error('HTTP '+r.status);
+    loadMarketplace();
+  }catch(e){showToast('❌ 切换失败：'+e.message,'error')}
+}
+
+// 安装：用户点按钮 = 已显式同意，直接同步执行 system.install；完成后刷新 + 提示逐依赖结果。
+async function installCap(name,btn){
+  if(btn){btn.disabled=true;btn.textContent='安装中…'}
+  try{
+    let r=await fetch('/api/capabilities/'+encodeURIComponent(name)+'/install',{method:'POST'});
+    let d=await r.json();
+    let res=(d&&d.result&&d.result.data)||null;
+    if(res&&res.deps&&res.deps.length){
+      let parts=res.deps.map(function(x){
+        let mark=(x.status==='already'||x.status==='installed')?'✓':'✗';
+        return mark+' '+x.label+(x.hint?'（'+x.hint+'）':'');
+      });
+      showToast((res.all_ok?'✅ 依赖已就绪：':'⚠️ ')+parts.join('；'),res.all_ok?'':'error');
+    } else {
+      let msg=(d&&d.result&&d.result.status&&d.result.status.message)||'安装失败';
+      showToast(res&&res.all_ok?'✅ 依赖已就绪':'❌ '+msg,'error');
+    }
+  }catch(e){showToast('❌ 安装失败：'+e.message,'error')}
+  if(btn){btn.disabled=false;btn.textContent='安装'}
+  loadMarketplace();
 }
 
 function renderServices(svcs){
@@ -1204,7 +1294,7 @@ function switchTab(name,el){
 async function refreshToolsAndServices(){
   try{
     let[h,t]=await Promise.all([fetch('/api/health').then(function(r){return r.json()}),fetch('/api/tools').then(function(r){return r.json()})]);
-    renderCaps(t.tools||[]);renderTools(t.tools||[]);renderServices(h.services||[]);
+    renderTools(t.tools||[]);renderServices(h.services||[]);loadMarketplace();
   }catch(e){}
 }
 
