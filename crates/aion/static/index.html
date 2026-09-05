@@ -233,6 +233,17 @@ body.lite .input-box{background:rgba(255,255,255,.09);border-color:rgba(255,255,
 .svc-row .n{font-family:monospace}
 .svc-row .st{font-size:11px;color:var(--ok)}
 .svc-row .st.pending{color:var(--txt2)}
+/* ── capability cards ── */
+.cap-row{border:1px solid var(--glass-brd);border-radius:10px;padding:12px 14px;margin-bottom:10px;background:rgba(124,110,228,.04)}
+.cap-row .top{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.cap-row .nm{font-family:monospace;font-size:14px;color:var(--acc);font-weight:600}
+.cap-row .vis{font-size:9px;padding:2px 6px;border-radius:4px;background:rgba(52,211,153,.12);color:var(--ok);border:1px solid rgba(52,211,153,.25)}
+.cap-row .sum{font-size:13px;color:var(--txt);margin-top:5px;line-height:1.45}
+.cap-row .desc{font-size:11px;color:var(--txt2);margin-top:5px;line-height:1.5;white-space:pre-line}
+.cap-row .provs{margin-top:9px;display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+.cap-row .plabel{font-size:10px;color:var(--txt2);margin-right:2px}
+.pchip{font-size:10px;padding:2px 9px;border-radius:10px;background:var(--bg3);color:var(--txt2);font-family:monospace;border:1px solid var(--glass-brd)}
+.cap-row .req{margin-top:7px;font-size:10px;color:var(--txt2);font-family:monospace}
 /* ── provider manager (cc-switch style) ── */
 .prov-row{border:1px solid var(--glass-brd);border-radius:10px;padding:12px 14px;margin-bottom:10px;transition:border-color .2s,background .2s}
 .prov-row.active{border-color:var(--acc);background:rgba(124,110,228,.08)}
@@ -298,6 +309,7 @@ body.lite .input-box{background:rgba(255,255,255,.09);border-color:rgba(255,255,
     <h2>⚙️ Settings <span class="x" onclick="closeSettings()">✕</span></h2>
     <div class="tab-bar">
       <div class="tab active" onclick="switchTab('llm',this)">LLM</div>
+      <div class="tab" onclick="switchTab('caps',this)">Capabilities</div>
       <div class="tab" onclick="switchTab('tools',this)">Tools</div>
       <div class="tab" onclick="switchTab('services',this)">Services</div>
     </div>
@@ -325,6 +337,10 @@ body.lite .input-box{background:rgba(255,255,255,.09);border-color:rgba(255,255,
         </div>
       </div>
       <button class="save-btn" id="addProvBtn" style="background:var(--bg3);color:var(--txt)" onclick="showProvForm()">＋ 添加供应商</button>
+    </div>
+    <div class="tab-content" id="tab-caps">
+      <p style="color:var(--txt2);font-size:11px;margin:0 0 10px">目标导向能力 = 给 Agent 的意图接口，内部落到下方叶子执行（AION 自动选）。</p>
+      <div id="capsList">Loading...</div>
     </div>
     <div class="tab-content" id="tab-tools">
       <div id="toolsList">Loading...</div>
@@ -365,7 +381,7 @@ setInterval(tickClock,1000);tickClock();
 async function init(){
   try{
     let[h,t]=await Promise.all([fetch('/api/health').then(r=>r.json()),fetch('/api/tools').then(r=>r.json())]);
-    renderTools(t.tools||[]);
+    renderCaps(t.tools||[]);renderTools(t.tools||[]);
     renderServices(h.services||[]);
     updateModelChip(h.llm);
   }catch(e){console.error(e)}
@@ -523,13 +539,45 @@ async function refreshHealth(){
   }catch(e){}
 }
 
+// 叶子工具清单：能力已被 Capabilities tab 收走，这里只列 kind=tool 的执行原语；
+// 标注哪些已被能力收编为 provider（不对模型暴露）、哪些还裸奔暴露给模型。
 function renderTools(tools){
   let el=document.getElementById('toolsList');
-  if(!tools.length){el.innerHTML='<p style="color:var(--txt2);font-size:13px">No tools registered</p>';return}
+  let caps=(tools||[]).filter(function(x){return x.kind==='capability'});
+  let leaves=(tools||[]).filter(function(x){return x.kind==='tool'});
+  if(!leaves.length){el.innerHTML='<p style="color:var(--txt2);font-size:13px">No leaf tools registered</p>';return}
+  // 被某能力收编的叶子（provider）→ 不对模型暴露
+  let provSet={};
+  caps.forEach(function(c){(c.providers||[]).forEach(function(p){provSet[p]=1})});
   el.innerHTML='';
-  tools.forEach(function(t){
+  leaves.forEach(function(t){
+    let tag=provSet[t.name]
+      ?'<span style="font-size:10px;padding:2px 6px;border-radius:4px;background:var(--bg3);color:var(--txt2);margin-left:6px">已收编 · provider</span>'
+      :'<span style="font-size:10px;padding:2px 6px;border-radius:4px;background:rgba(124,110,228,.15);color:var(--acc);margin-left:6px">暴露给模型</span>';
     let d=document.createElement('div');d.className='tool-row';
-    d.innerHTML='<div><span class="n">'+t.name+'</span><span class="risk risk-'+t.risk+'">'+t.risk+'</span><div class="d">'+esc(t.description)+'</div></div>';
+    d.innerHTML='<div style="width:100%"><div><span class="n">'+t.name+'</span><span class="risk risk-'+t.risk+'">'+t.risk+'</span>'+tag+'</div><div class="d">'+esc(t.description)+'</div></div>';
+    el.appendChild(d);
+  });
+}
+
+// Capability 卡片：每个能力 = 给 Agent 的目标接口，列出其下的 provider 叶子。
+function renderCaps(tools){
+  let el=document.getElementById('capsList');
+  let caps=(tools||[]).filter(function(x){return x.kind==='capability'});
+  if(!caps.length){el.innerHTML='<p style="color:var(--txt2);font-size:13px">No capabilities registered</p>';return}
+  el.innerHTML='';
+  caps.forEach(function(c){
+    let chips=(c.providers||[]).map(function(p){return '<span class="pchip">'+esc(p)+'</span>'}).join('');
+    let req=(c.required_caps||[]).join(', ');
+    let d=document.createElement('div');d.className='cap-row';
+    d.innerHTML=
+      '<div class="top"><span class="nm">'+esc(c.name)+'</span>'+
+      '<span class="vis">暴露给模型</span>'+
+      '<span class="risk risk-'+c.risk+'">'+c.risk+'</span></div>'+
+      '<div class="sum">'+esc(c.summary)+'</div>'+
+      (c.description?'<div class="desc">'+esc(c.description)+'</div>':'')+
+      (chips?'<div class="provs"><span class="plabel">↓ provider</span>'+chips+'</div>':'')+
+      (req?'<div class="req">required_caps: '+esc(req)+'</div>':'');
     el.appendChild(d);
   });
 }
@@ -1106,7 +1154,7 @@ function switchTab(name,el){
 async function refreshToolsAndServices(){
   try{
     let[h,t]=await Promise.all([fetch('/api/health').then(function(r){return r.json()}),fetch('/api/tools').then(function(r){return r.json()})]);
-    renderTools(t.tools||[]);renderServices(h.services||[]);
+    renderCaps(t.tools||[]);renderTools(t.tools||[]);renderServices(h.services||[]);
   }catch(e){}
 }
 
