@@ -357,6 +357,11 @@ impl Tool for AppOpenTool {
                 .map(|f| f == "mpv")
                 .unwrap_or(false);
             if is_mpv {
+                // 禁掉 mpv 内建 ytdl_hook：直链已由 yt-dlp 解析好，直接打开即可。mpv 0.34 的
+                // hook 会在 mpv 首次探测不顺时拿直链 URL 二次解析，把超长查询串(如 B 站 m4s
+                // 的 buvid3/...参数)拆坏成 `'buvid3=...' is not a valid URL` → 秒退。实测
+                // `--ytdl=no` 后 mpv 直连直链可完整放到底。
+                cmd.arg("--ytdl=no");
                 if let Some(origin) = origin_of(&path) {
                     cmd.arg(format!("--user-agent={BROWSER_UA}"));
                     cmd.arg(format!("--http-header-fields=Referer: {origin}/"));
