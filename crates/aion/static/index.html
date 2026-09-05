@@ -118,6 +118,29 @@ body.lite .input-box{background:rgba(255,255,255,.09);border-color:rgba(255,255,
 .blk-chart svg{width:100%;height:auto;display:block}
 .blk-chart .gl{stroke:rgba(255,255,255,.06)}
 .blk-chart .ax{fill:var(--txt2);font-size:10px}
+/* 网页感卡片：AION 自己把抓到的页面结构画成站点样式（非真实网页视口） */
+.blk-wp{background:var(--bg2);border:1px solid var(--glass-brd);border-radius:14px;overflow:hidden;margin:8px 0}
+.blk-wp .top{display:flex;align-items:center;gap:8px 14px;padding:9px 16px;border-bottom:1px solid var(--glass-brd);flex-wrap:wrap;font-size:12px}
+.blk-wp .top .nav{display:flex;align-items:center;gap:0;flex-wrap:wrap}
+.blk-wp .top .nav a{color:var(--txt2);text-decoration:none;padding:0 9px;white-space:nowrap}
+.blk-wp .top .nav a:hover{color:var(--fg);text-decoration:underline}
+.blk-wp .top .nav i.sp{width:1px;height:11px;background:var(--glass-brd);flex:none}
+.blk-wp .top .brd{margin-left:auto;font-size:13px;font-weight:700;letter-spacing:.3px}
+.blk-wp .hero{display:flex;flex-direction:column;align-items:center;gap:8px;padding:30px 18px 10px;text-align:center}
+.blk-wp .hero .lg{max-height:62px;max-width:min(240px,80%);object-fit:contain}
+.blk-wp .hero .nm{font-size:27px;font-weight:700;letter-spacing:.5px}
+.blk-wp .hero .tg{font-size:12px;color:var(--txt2);max-width:600px;line-height:1.6}
+.blk-wp .srch{display:flex;justify-content:center;padding:12px 18px 20px}
+.blk-wp .srch .in{width:min(520px,100%);display:flex;align-items:center;background:var(--bg1);border:1px solid var(--glass-brd);border-radius:999px;overflow:hidden;box-shadow:0 4px 18px rgba(0,0,0,.16)}
+.blk-wp .srch .q{flex:1;min-width:0;background:transparent;border:0;outline:0;padding:10px 16px;font-size:13px;color:var(--fg)}
+.blk-wp .srch .q::placeholder{color:var(--txt2)}
+.blk-wp .srch .go{border:0;color:#fff;padding:10px 22px;font-size:13px;font-weight:600;cursor:default;flex:none}
+.blk-wp .foot{display:flex;align-items:center;gap:6px 10px;padding:8px 16px;border-top:1px solid var(--glass-brd);font-size:11px;color:var(--txt2);flex-wrap:wrap}
+.blk-wp .foot .fl{display:flex;align-items:center;flex-wrap:wrap}
+.blk-wp .foot .fl a{color:var(--txt2);text-decoration:none;padding:0 8px;white-space:nowrap}
+.blk-wp .foot .fl a:hover{text-decoration:underline}
+.blk-wp .foot .fl i.sp{width:1px;height:10px;background:var(--glass-brd);flex:none}
+.blk-wp .foot .mt{margin-left:auto;font-family:monospace}
 .blk-img{margin:8px 0}
 .blk-img img{max-width:100%;max-height:420px;object-fit:contain;border-radius:12px;border:1px solid var(--glass-brd);display:block;background:#000}
 .blk-img .cap{font-size:11px;color:var(--txt2);margin-top:6px;text-align:center}
@@ -588,7 +611,7 @@ function onSSE(ev){
       appendChip('🔧 '+(ev.tool||'tool')+(ev.command?' → $ '+ev.command:''));
       break;
     case'terminal':case'confirmation':case'table':case'file':case'image':
-    case'chart':case'markdown':case'stats':case'process':case'rich':
+    case'chart':case'markdown':case'stats':case'process':case'rich':case'webpage':
       removeTyping();openBubble=null;openAcc='';
       appendBlock(ev);
       break;
@@ -673,10 +696,47 @@ function renderBlock(b){
     case'chart':return renderChart(b);
     case'stats':return renderStats(b);
     case'process':return renderProcess(b);
+    case'webpage':return renderWebpage(b);
     default:return'';
   }
 }
 
+// 网页感卡片渲染器：AION 自己把站点结构排成原生 DOM（顶栏导航/hero logo/
+// 搜索框/页脚）。站点主色仅接受 #hex，图片仅 http(s)，其余一律转义。
+function safeColor(c){
+  return(/^#[0-9a-fA-F]{3,8}$/.test(c||''))?c:'';
+}
+function renderWebpage(b){
+  let c=safeColor(b.color)||'#1E6FFF';
+  function A(o){
+    if(!o||!o.url||!/^https?:\/\//i.test(o.url))return'';
+    return'<a href="'+escA(o.url)+'" target="_blank" rel="noopener">'+esc(o.text||o.url)+'</a>';
+  }
+  function sep(list){return list.filter(Boolean).join('<i class="sp"></i>');}
+  let nav=sep((b.nav||[]).map(A));
+  let foot=sep((b.footer||[]).map(A));
+  let brandName=esc(b.brand||b.title||'');
+  let lg=(b.logo&&/^https?:\/\//i.test(b.logo))
+    ?'<img class="lg" src="'+escA(b.logo)+'" alt="logo" onerror="this.remove()">':'';
+  let top='<div class="top">'+(nav?'<div class="nav">'+nav+'</div>':'')+
+    (brandName?'<div class="brd" style="color:'+c+'">'+brandName+'</div>':'')+'</div>';
+  let hero=(lg||brandName||b.tagline)?'<div class="hero">'+
+    (lg||'<div class="nm" style="color:'+c+'">'+brandName+'</div>')+
+    (b.tagline?'<div class="tg">'+esc(b.tagline)+'</div>':'')+'</div>':'';
+  let s=b.search||null;
+  let sr='';
+  if(s&&s!==null){
+    let ph=s.placeholder||('在'+esc(b.brand||'站内')+'搜索');
+    sr='<div class="srch"><div class="in"><input class="q" readonly placeholder="'+escA(ph)+'">'+
+       '<span class="go" style="background:'+c+'">'+esc(s.button||'搜索')+'</span></div></div>';
+  }
+  let footRow='';
+  if(foot||b.meta){
+    footRow='<div class="foot">'+(foot?'<span class="fl">'+foot+'</span>':'')+
+      (b.meta?'<span class="mt">'+esc(b.meta)+'</span>':'')+'</div>';
+  }
+  return'<div class="blk-wp">'+top+hero+sr+footRow+'</div>';
+}
 function renderStats(b){
   let s=b.data||b,html='<div class="blk-stats">';
   // CPU：换算 busy 比例（user+system+nice vs total，越忙越偏暖色）

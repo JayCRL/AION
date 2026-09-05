@@ -120,6 +120,18 @@ async fn fetch_page(url: &str) -> Result<Value, String> {
     let title = cap(unescape(&strip_text(&extract_title(&html))), 200);
     let description = cap(unescape(&strip_text(&extract_meta(&html, &["description", "og:description"]))), 400);
     let links = extract_links(&html, &final_url);
+    // —— 站点感知重建：导航/logo/搜索框/页脚 + 品牌皮肤 ——
+    let brand = brand_for(&final_url);
+    let logo = find_logo(&html, &final_url).or_else(|| {
+        let og = extract_meta(&html, &["og:image"]);
+        if og.is_empty() {
+            None
+        } else {
+            resolve_abs(&og, &final_url, &origin_of(&final_url), &scheme_of(&final_url))
+        }
+    });
+    let search = find_search(&html);
+    let (nav, footer) = split_nav_footer(&links, &final_url);
 
     Ok(json!({
         "url": final_url,
@@ -129,7 +141,193 @@ async fn fetch_page(url: &str) -> Result<Value, String> {
         "title": title,
         "description": description,
         "links": links,
+        // 结构：站点皮肤入口（渲染成原生"网页感"卡片）
+        "brand_name": brand.0,
+        "brand_color": brand.1,
+        "logo": logo,
+        "nav": nav,
+        "search": search,
+        "footer": footer,
     }))
+}
+
+// ---------------------------------------------------------------------------
+// 站点感知：品牌皮肤 + 结构提取（"逐站加皮肤"的可插拔点）
+// ---------------------------------------------------------------------------
+
+/// 品牌皮肤表：host 片段 → (显示名, 主色)。没命中就用域名兜底 + 默认主色。
+/// 后续加站点只改这里（或再下钻到独立识别器）。
+fn brand_for(url: &str) -> (String, String) {
+    let host = host_of(url);
+    let h = host.to_ascii_lowercase();
+    if h.contains("baidu.com") {
+        return ("百度".into(), "#2932E1".into());
+    }
+    if h.contains("wust.edu.cn") {
+        return ("武汉科技大学".into(), "#8E1F2F".into());
+    }
+    if h.contains("github.com") {
+        return ("GitHub".into(), "#24292F".into());
+    }
+    if h.contains("bilibili.com") {
+        return ("哔哩哔哩".into(), "#FB7299".into());
+    }
+    // 兜底：取 host 最左段（去 www）
+    let label = h
+        .split('.')
+        .next()
+        .unwrap_or("")
+        .trim_start_matches("www")
+        .to_string();
+    let name = if label.is_empty() { host } else { label };
+    (name, "#1E6FFF".into())
+}
+
+fn host_of(url: &str) -> String {
+    let origin = origin_of(url);
+    origin
+        .trim_start_matches("http://")
+        .trim_start_matches("https://")
+        .to_string()
+}
+
+fn scheme_of(url: &str) -> String {
+    url.split("://").next().unwrap_or("https").to_string()
+}
+
+/// 候选 logo：扫前若干 <img>，命中 id="lg" 或 id/class/src/alt 含 "logo" 的绝对 URL。
+fn find_logo(html: &str, base: &str) -> Option<String> {
+    let mut from = 0usize;
+    for _ in 0..60 {
+        let s = match find_ci(html, "<img", from) {
+            Some(x) => x,
+            None => return None,
+        };
+        let open_len = tag_open_len(&html[s..]);
+        if open_len == 0 {
+            return None;
+        }
+        from = s + open_len + 1;
+        let tag = &html[s..s + open_len + 1];
+        let src = match attr_value(tag, "src") {
+            Some(v) => v,
+            None => continue,
+        };
+        let resolved = match resolve_abs(&src, base, &origin_of(base), &scheme_of(base)) {
+            Some(r) => r,
+            None => continue,
+        };
+        let id = attr_value(tag, "id").unwrap_or_default().to_ascii_lowercase();
+        let class = attr_value(tag, "class").unwrap_or_default().to_ascii_lowercase();
+        let alt = attr_value(tag, "alt").unwrap_or_default().to_ascii_lowercase();
+        let src_l = resolved.to_ascii_lowercase();
+        let strong = id == "lg" || id.contains("logo") || class.contains("logo")
+            || alt.contains("logo") || src_l.contains("/logo") || src_l.contains("logo.");
+        let weak = alt.contains("logo") || alt.contains("徽标") || class.contains("s-logo");
+        if strong || weak {
+            return Some(resolved);
+        }
+    }
+    None
+}
+
+/// 搜索框：type=text/search / name=wd / id=kw 的输入框 → {placeholder, button}。
+fn find_search(html: &str) -> Option<Value> {
+    let mut from = 0usize;
+    for _ in 0..30 {
+        let s = match find_ci(html, "<input", from) {
+            Some(x) => x,
+            None => return None,
+        };
+        let open_len = tag_open_len(&html[s..]);
+        if open_len == 0 {
+            return None;
+        }
+        from = s + open_len + 1;
+        let tag = &html[s..s + open_len + 1];
+        let low = tag.to_ascii_lowercase();
+        let ty = attr_value(tag, "type").unwrap_or_default().to_ascii_lowercase();
+        let name = attr_value(tag, "name").unwrap_or_default().to_ascii_lowercase();
+        let id = attr_value(tag, "id").unwrap_or_default().to_ascii_lowercase();
+        if low.contains("submit") || ty == "hidden" || ty == "password" {
+            continue;
+        }
+        let is_query = ty == "search" || ty == "text" || name == "wd" || name == "q" || id == "kw";
+        if !is_query {
+            continue;
+        }
+        let placeholder = attr_value(tag, "placeholder")
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        // 就近取提交按钮文字：往后 1200 字节内第一个 type=submit 的 value
+        let window = &html[from..(from + 1200).min(html.len())];
+        let mut button: String = String::new();
+        let mut wf = 0usize;
+        while let Some(b) = find_ci(window, "<input", wf) {
+            let bl = tag_open_len(&window[b..]);
+            if bl == 0 {
+                break;
+            }
+            wf = b + bl + 1;
+            let btag = &window[b..b + bl + 1];
+            let bt = attr_value(btag, "type").unwrap_or_default().to_ascii_lowercase();
+            if bt.contains("submit") {
+                button = attr_value(btag, "value").unwrap_or_default().trim().to_string();
+                break;
+            }
+        }
+        if button.is_empty() {
+            // 找 <button ...>文字</button>
+            if let Some(b) = find_ci(window, "<button", 0) {
+                let bl = tag_open_len(&window[b..]);
+                if bl > 0 {
+                    let inner = &window[b + bl + 1..];
+                    if let Some(c) = find_ci(inner, "</button", 0) {
+                        button = cap(collapse(&unescape(&plain_text(&inner[..c]))), 20);
+                    }
+                }
+            }
+        }
+        if button.is_empty() {
+            button = "搜索".into();
+        }
+        return Some(json!({ "placeholder": placeholder, "button": button }));
+    }
+    None
+}
+
+/// 导航（页首若干链接，去站内自链）+ 页脚（未进导航的尾段链接）。
+fn split_nav_footer(links: &[Value], url: &str) -> (Vec<Value>, Vec<Value>) {
+    let origin = origin_of(url);
+    let mut nav: Vec<Value> = Vec::new();
+    let mut footer: Vec<Value> = Vec::new();
+    let total = links.len();
+    for (i, l) in links.iter().enumerate() {
+        let text = l.get("text").and_then(|v| v.as_str()).unwrap_or("").trim();
+        let u = l.get("url").and_then(|v| v.as_str()).unwrap_or("");
+        if text.is_empty() || u.is_empty() {
+            continue;
+        }
+        // 站内首页自链不入导航
+        if u.trim_end_matches('/') == origin.trim_end_matches('/') {
+            continue;
+        }
+        // 顶栏导航剔除账号/杂项入口，贴近站点主导航
+        if ["登录", "设置", "注册", "百度首页", "更多"].contains(&text) {
+            continue;
+        }
+        let in_nav = nav.iter().any(|n| n == l);
+        if i < 8 && nav.len() < 8 {
+            nav.push(l.clone());
+        } else if footer.len() < 5
+            && !in_nav
+            && (total - i <= 5 || text.contains('©') || text.contains("ICP") || text.contains("关于"))
+        {
+            footer.push(l.clone());
+        }
+    }
+    (nav, footer)
 }
 
 // ---------------------------------------------------------------------------
@@ -606,8 +804,23 @@ mod tests {
         println!("TITLE={title} LINKS={links} STATUS={}", page["status"]);
         assert!(title.contains("百度"), "title should be baidu, got {title:?}");
         assert!(links > 0, "expected some links");
-        for l in page["links"].as_array().unwrap().iter().take(5) {
-            println!("  - {} → {}", l["text"], l["url"]);
+        println!(
+            "BRAND={}/{} LOGO={:?} NAV={} SEARCH={:?} FOOTER={}",
+            page.get("brand_name").and_then(|v| v.as_str()).unwrap_or(""),
+            page.get("brand_color").and_then(|v| v.as_str()).unwrap_or(""),
+            page.get("logo"),
+            page.get("nav").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0),
+            page.get("search"),
+            page.get("footer").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0),
+        );
+        assert_eq!(page.get("brand_name").and_then(|v| v.as_str()), Some("百度"));
+        let nav = page.get("nav").and_then(|v| v.as_array()).unwrap();
+        assert!(!nav.is_empty(), "expected nav links");
+        assert!(!nav.iter().any(|l| l.get("text").and_then(|v| v.as_str()) == Some("登录")),
+            "nav should not contain 登录");
+        assert!(page.get("search").is_some(), "expected a search box");
+        for l in nav.iter().take(8) {
+            println!("  nav: {} → {}", l["text"], l["url"]);
         }
     }
 }
