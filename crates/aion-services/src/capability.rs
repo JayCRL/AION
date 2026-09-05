@@ -168,18 +168,19 @@ pub fn register_builtin_capabilities() -> CapabilityRegistry {
     // ======================================================================
     //
     // 「file.read 应该是 read 然后按类型打开阅读器」：文本/代码 AION 自己当阅读器
-    // （file.read → 代码围栏），图片原生显示（file.read base64 → image 块），目录列
-    // 条目（file.list → table），媒体 / PDF / Office 交给**已装的外部程序**（app.open →
-    // 桌面直接弹 vlc / evince / libreoffice）。三个叶子都是 provider-only，藏到能力背后。
+    // （file.read → 代码围栏），目录列条目（file.list → table），图片 / 媒体 / PDF /
+    // Office 交给**已装的外部程序**（app.open → 桌面直接弹 feh / vlc / zathura /
+    // libreoffice）。用户已拍板：图片跟视频一样**弹外部看图窗口**，不内嵌。
     let fdef = CapabilityDefinition {
         name: "file.view".into(),
-        summary: "查看 / 打开一个本地文件或目录（按类型自动选阅读方式：文本自渲染、图片原生显示、目录列表、媒体/PDF/Office 交给已装阅读器自动打开）".into(),
+        summary: "查看 / 打开一个本地文件或目录（按类型自动选阅读方式：文本自渲染、图片/媒体/PDF/Office 交给已装看图或阅读器自动弹出、目录列表）".into(),
         description: concat!(
             "查看 path 指向的本地文件或目录。自动按文件类型决定怎么呈现：文本/代码/日志/",
-            "数据 → AION 直接渲染成正文；图片 → 原生显示；目录 → 列出条目；视频/音频/",
-            "PDF/Office → 直接调用本机已安装的阅读器程序（vlc/evince/libreoffice…）打开，",
-            "窗口会弹到桌面。可选 mode 强制路径：text（当文本读）/ base64（取原始字节）/ ",
-            "list（当目录列）/ app（只调用外部程序）。给 path 即可。"
+            "数据 → AION 直接渲染成正文；图片 → 直接打开本机已装的看图程序（feh/eog/",
+            "display…），窗口弹到桌面；目录 → 列出条目；视频/音频/PDF/Office → 直接调用",
+            "本机已安装的阅读器程序（vlc/evince/libreoffice…）打开。可选 mode 强制路径：",
+            "text（当文本读）/ base64（取原始字节）/ list（当目录列）/ app（只调用外部程序）。",
+            "给 path 即可。"
         )
         .into(),
         input: JsonSchemaDocument::new(JsonSchema::Object {
@@ -250,11 +251,9 @@ pub fn register_builtin_capabilities() -> CapabilityRegistry {
         }
         let ext = lower_ext(&path);
         if image_mime(&ext).is_some() {
-            // 图片 → 原生显示。限 4MB 原始字节，避免超大图打爆 SSE/data URL。
-            return ResolvedProvider {
-                tool: "file.read".into(),
-                arguments: json!({ "path": path, "encoding": "base64", "max_bytes": 4_000_000 }),
-            };
+            // 图片 → 弹已装看图程序（feh/eog/display），与视频/PDF 同一机制。想取原始
+            // 字节内嵌可显式 mode=base64。
+            return open(path);
         }
         if is_text_ext(&ext) {
             return read(path, false); // 文本 → 自渲染
@@ -304,9 +303,15 @@ pub fn is_external_ext(ext: &str) -> bool {
     )
 }
 
-/// launch 横幅用的图标：媒体 → 🎬，办公/电子书 → 📊，其余文档 → 📄。
+/// launch 横幅用的图标：图片 → 🖼️，媒体 → 🎬，办公/电子书 → 📊，其余文档 → 📄。
 pub fn viewer_icon(ext: &str) -> &'static str {
     if matches!(
+        ext,
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg" | "bmp" | "ico" | "avif" | "tif"
+            | "tiff" | "heic"
+    ) {
+        "🖼️"
+    } else if matches!(
         ext,
         "mp4" | "mkv" | "avi" | "mov" | "webm" | "m4v" | "mp3" | "flac" | "wav" | "m4a"
             | "ogg" | "opus" | "aac"

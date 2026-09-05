@@ -151,7 +151,9 @@ fn find_command_word(low: &str, word: &str) -> Option<usize> {
     let mut i = 0;
     let wlen = word.len();
     while i + wlen <= bytes.len() {
-        if &low[i..i + wlen] == word {
+        // 用字节窗口比较：word 全是 ASCII，避免逐字节前进 i 落在多字节字符中间时
+        // `&low[i..]` 按 char boundary 切片 panic（含中文的命令会踩到）。
+        if &bytes[i..i + wlen] == word.as_bytes() {
             let before_ok = i == 0
                 || matches!(bytes[i - 1], b' ' | b'\t' | b';' | b'&' | b'|' | b'\n' | b'\r' | b'(');
             let after = low.as_bytes().get(i + wlen).copied();

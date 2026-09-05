@@ -24,6 +24,11 @@ use serde_json::{json, Value};
 /// 扩展名 → 候选查看器（白名单；顺序即优先级）。空 = 无匹配，走 `xdg-open` 兜底。
 fn viewer_candidates(ext: &str) -> Vec<&'static str> {
     match ext {
+        // 图片：看图程序
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg" | "bmp" | "ico" | "avif"
+        | "tif" | "tiff" | "heic" => {
+            vec!["feh", "display", "eog", "ristretto", "gpicview", "qimgv", "viewnior"]
+        }
         // 媒体：能放视频 / 音频的播放器
         "mp4" | "mkv" | "avi" | "mov" | "webm" | "m4v" | "mp3" | "flac" | "wav" | "m4a"
         | "ogg" | "opus" | "aac" => vec!["vlc", "mpv", "ffplay", "mplayer"],
@@ -115,8 +120,8 @@ impl AppOpenTool {
             def: ToolDefinition {
                 name: "app.open".into(),
                 description: concat!(
-                    "用本机已安装的阅读器程序打开一个本地文件：按扩展名自动选播放器/阅读器",
-                    "（媒体→vlc/mpv，PDF→evince/zathura，Office→libreoffice），找到就启动并把",
+                    "用本机已安装的阅读器程序打开一个本地文件：按扩展名自动选播放器/看图器/阅读器",
+                    "（图片→feh/eog，媒体→vlc/mpv，PDF→zathura，Office→libreoffice），找到就启动并把",
                     "窗口弹到桌面。可选 app= 显式指定白名单内程序。这是 file.view 内部的打开原语。"
                 )
                 .into(),
