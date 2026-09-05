@@ -63,6 +63,31 @@ fn which_bin(names: &[&str]) -> Option<String> {
     None
 }
 
+/// 确保子进程能连到桌面 X server。
+///
+/// AION web 常以 user service 启动（systemd session scope，parent pid=1），env 里**没有
+/// DISPLAY**——裸 `spawn` 一个 GUI 程序会 headless 跑、窗口不出现。kiosk 的 X server 在
+/// :0（lightdm 自动登录 wust_1）。若继承的 env 已有 DISPLAY（后端直接在 X 会话里跑）就
+/// 原样用；否则补 `DISPLAY=:0`（可用 `AION_DISPLAY` 覆盖）+ `~/.Xauthority`。
+fn ensure_display_env(cmd: &mut std::process::Command) {
+    let has_display = std::env::var("DISPLAY")
+        .map(|d| !d.trim().is_empty())
+        .unwrap_or(false);
+    if has_display {
+        return;
+    }
+    let disp = std::env::var("AION_DISPLAY").unwrap_or_else(|_| ":0".into());
+    cmd.env("DISPLAY", disp);
+    if std::env::var("XAUTHORITY").is_err() {
+        if let Ok(home) = std::env::var("HOME") {
+            let xa = format!("{home}/.Xauthority");
+            if Path::new(&xa).exists() {
+                cmd.env("XAUTHORITY", &xa);
+            }
+        }
+    }
+}
+
 fn is_exec(p: &Path) -> bool {
     match std::fs::metadata(p) {
         Ok(m) if m.is_file() => {
@@ -183,7 +208,10 @@ impl Tool for AppOpenTool {
             );
         };
 
-        match std::process::Command::new(&bin).arg(&path).spawn() {
+        let mut cmd = std::process::Command::new(&bin);
+        cmd.arg(&path);
+        ensure_display_env(&mut cmd);
+        match cmd.spawn() {
             Ok(_) => ToolResult::success(json!({
                 "path": path,
                 "app": bin,
