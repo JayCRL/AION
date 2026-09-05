@@ -154,14 +154,12 @@ fn resolve_media_url(raw: &str) -> Option<String> {
             return None;
         };
         let start = Instant::now();
-        let mut got_url = false;
+        // 等子进程结束（或超时杀掉）。**不以退出码判成败**：新版 yt-dlp(2026.08.19) 即使成功
+        // 把直链打在 stdout 也常以 rc=1 退出（无害收尾告警）；412 时则 stdout 无 http 行。故成败
+        // 只看「stdout 里拿到 http 行」——否则会把「rc=1 但直链已输出」误判为失败而丢直链。
         loop {
             match child.try_wait() {
-                Ok(Some(st)) if st.success() => {
-                    got_url = true;
-                    break;
-                }
-                Ok(Some(_)) => break, // 本次失败（多半 412）→ 外层重试
+                Ok(Some(_)) => break,
                 Ok(None) => {}
                 Err(_) => break,
             }
@@ -172,17 +170,18 @@ fn resolve_media_url(raw: &str) -> Option<String> {
             }
             std::thread::sleep(Duration::from_millis(200));
         }
-        if !got_url {
-            continue;
-        }
         let mut s = String::new();
-        let mut out = child.stdout.take()?;
-        out.read_to_string(&mut s).ok()?;
+        if let Some(mut out) = child.stdout.take() {
+            if out.read_to_string(&mut s).is_err() {
+                continue; // stdout 读不动 → 当本次失败，重试
+            }
+        }
         if let Some(url) = s.lines().map(str::trim).find(|l| {
             !l.is_empty() && (l.starts_with("http://") || l.starts_with("https://"))
         }) {
             return Some(url.to_string());
         }
+        // 没拿到 http 行（多半 412）→ 外层换全新进程（新 buvid cookie）重试。
     }
     None
 }
