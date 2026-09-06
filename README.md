@@ -4,7 +4,7 @@
 
 # AION
 
-**Agent Operating Infrastructure & Nations · Agent OS Runtime**
+**Agent OS Runtime · AI 层替代应用层：用户只与 AI 对话，系统服务直连 Linux 内核**
 
 基于 Linux 的 Agent「操作系统」运行时：Cordis-RS 核心 · 系统服务 · Linux 适配层
 
@@ -13,6 +13,30 @@
 [![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](https://www.rust-lang.org)
 
 </div>
+
+---
+
+## 项目定位
+
+**AION 不是"又一个通用 Agent 框架"，而是一台 Linux 设备上的专用 Agent 操作系统。**
+
+- **核心主张**：用 AI 层替代应用层。用户不操作 App，只与 AI 对话，AI 通过系统服务直接满足需求。
+- **与通用 Agent 框架（如 DeepSeek Harness / DSH）的分野**：
+
+| | 通用 Agent 框架 | AION |
+|---|---|---|
+| 定位 | AI 作为应用 | AI 作为操作系统 |
+| 工具来源 | 插件生态（可拼装） | 内核级系统服务（process/fs/net/terminal/media/sandbox/…） |
+| 安全边界 | 审批弹窗（人在环） | namespace / cgroup v2 / seccomp / capability（机制在环） |
+| 生命周期 | 会话制 | 常驻服务制（Scope / Fiber / Lifecycle） |
+| 面向 | 会配置的开发者 | 设备的使用者 |
+
+- **判定标准**（每次加功能前自问）：
+  1. 这个功能服务于"对话替代 App"吗？不是 → 不做；
+  2. 这个功能 DSH 加个插件/命令三分钟就能实现吗？是 → 不做（那不属于 AION 的护城河）；
+  3. 它用到了只有内核层才能保证的东西（持久沙箱 / 多租户隔离 / 资源记账 / 事件驱动 / 常驻生命周期）吗？是 → 这才是 AION 该做的主线。
+
+- **AION 不打算赢下的战场**：通用聊天 UI、LLM 供应商管理、跨平台桌面体验——这些成熟方案（DSH、cc-switch 等）已经做得更好，用户也感知不到差异。
 
 ---
 
